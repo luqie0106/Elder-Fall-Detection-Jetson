@@ -35,7 +35,7 @@ BASE_HORIZONTAL_RATIO_TH = 0.8
 # 摄像头俯仰角配置（单位：度）
 # 系统会自动根据该角度放宽“弯腰”和“躺倒”的判定。
 # 若设为 AUTO_DETECT_CAMERA_ANGLE = True，则实时动态估算角度。
-AUTO_DETECT_CAMERA_ANGLE = False
+AUTO_DETECT_CAMERA_ANGLE = True
 CAMERA_PITCH_ANGLE = 0.0
 
 # 自动估角与动态阈值补偿配置
@@ -83,28 +83,13 @@ SUPPORT_OVERLAP_TH = 0.2
 # 至少有效髋点数量（调大更紧）
 LOWER_BODY_MIN_HIPS = 1
 # 下半身总有效点数量（调大更紧）
-LOWER_BODY_MIN_POINTS = 3
-# 是否强制要求“下半身足够可见”才允许触发跌倒
-REQUIRE_LOWER_BODY_FOR_FALL = True
-# 是否强制要求“下半身几何关系可靠”才允许触发跌倒
-REQUIRE_LOWER_BODY_GEOMETRY_FOR_FALL = True
+LOWER_BODY_MIN_POINTS = 2
 # 下半身几何可靠性（调大更紧）
 LOWER_BODY_MIN_HIP_ANKLE_DY_RATIO = 0.18
 LOWER_BODY_KNEE_MID_TOL_RATIO = 0.12
 # 核心躯干门控：至少1个肩点+1个髋点，才允许参与跌倒判定
 CORE_BODY_MIN_SHOULDERS = 1
 CORE_BODY_MIN_HIPS = 1
-
-# 近景半身抑制：当“头部在人体框中占比过大”时，不触发跌倒
-# 头部占比阈值（调小更紧，更容易抑制）
-HEAD_DOMINANT_RATIO_TH = 0.46
-# 头部宽高比下限（过窄通常不是近景头部）
-HEAD_DOMINANT_MIN_ASPECT_RATIO = 0.55
-# 近景上半身/截头画面抑制（与 head_dominant 互补）
-CLOSEUP_BOTTOM_RATIO_TH = 0.88
-CLOSEUP_MIN_HEIGHT_RATIO_TH = 0.40
-CLOSEUP_HEAD_TOP_EDGE_RATIO_TH = 0.06
-CLOSEUP_CLEAR_FALL_FRAMES = 2
 
 # 坐姿门控（用于抑制坐姿误报）
 # 躯干纵向占优比例阈值（调大更紧，不易判坐姿）
@@ -334,11 +319,11 @@ def detect_fall_sequence(history):
 
     # 主路径：完整证据
     strong_path = cond1 and cond2 and cond2b and cond3 and (cond4 or very_large_drop)
-    # 恢复兜底（收紧）：仍要求髋部下落，避免站立前倾/抖动触发
-    fallback_path = cond1 and cond2 and cond2b and cond3 and (cond4 or very_large_drop)
+    # 恢复兜底：当髋部跟踪抖动时允许触发（仍要求姿态变化+下落+速度+冲击）
+    fallback_path = cond1 and cond2 and cond3 and (cond4 or very_large_drop)
 
-    # 侧后摔专用路径（收紧）：要求髋部同步下落，抑制站立误触发
-    side_back_path = ("vertical" in postures[:FALL_SEQ_WINDOW]) and cond2 and cond2b and cond3 and cond_shape and (cond4 or very_large_drop)
+    # 侧后摔专用路径：即使“横躺标签”不明显，只要有明显下落+速度+高度塌缩也可触发
+    side_back_path = ("vertical" in postures[:FALL_SEQ_WINDOW]) and cond2 and cond3 and cond_shape and (cond4 or very_large_drop)
 
     if strong_path or fallback_path or side_back_path:
         return True
@@ -454,44 +439,6 @@ def has_core_body(keypoints):
             hips_valid += 1
 
     return shoulders_valid >= CORE_BODY_MIN_SHOULDERS and hips_valid >= CORE_BODY_MIN_HIPS
-
-def is_head_dominant_closeup(keypoints):
-    """
-    近景半身/大头特写抑制：
-    - 估计头部区域（额顶到肩线）在人体框中的高度占比；
-    - 占比过大时，认为是近景半身，不参与跌倒触发。
-    """
-    valid_xy = keypoints[(keypoints[:, 0] > 0) & (keypoints[:, 1] > 0)]
-    if len(valid_xy) < 4:
-        return False
-
-    x_min, y_min = valid_xy.min(axis=0)
-    x_max, y_max = valid_xy.max(axis=0)
-    body_h = max(1.0, y_max - y_min)
-
-    face_pts = [keypoints[i] for i in [0, 1, 2, 3, 4] if keypoints[i][0] > 0 and keypoints[i][1] > 0]
-    if len(face_pts) < 2:
-        return False
-
-    face_arr = np.array(face_pts, dtype=np.float32)
-    face_x_min, face_y_min = face_arr.min(axis=0)
-    face_x_max, _ = face_arr.max(axis=0)
-
-    shoulder_ys = [keypoints[i][1] for i in [5, 6] if keypoints[i][0] > 0 and keypoints[i][1] > 0]
-    if shoulder_ys:
-        head_bottom_y = float(np.mean(shoulder_ys))
-    else:
-        # 无肩点时，使用脸部高度近似，避免误抑制
-        face_h = max(1.0, float(face_arr[:, 1].max() - face_y_min))
-        head_bottom_y = float(face_y_min + 2.2 * face_h)
-
-    head_h = max(1.0, head_bottom_y - float(face_y_min))
-    head_ratio = head_h / body_h
-
-    face_w = max(1.0, float(face_x_max - face_x_min))
-    head_aspect = face_w / head_h
-
-    return head_ratio >= HEAD_DOMINANT_RATIO_TH and head_aspect >= HEAD_DOMINANT_MIN_ASPECT_RATIO
 
 def is_probable_sitting(keypoints):
     # 用肩-髋-膝几何关系做“坐姿”门控，避免坐着被当成跌倒
@@ -1150,7 +1097,6 @@ while True:
                     "seen_frames": 0,
                     "horizontal_frames": 0,
                     "side_lying_frames": 0,
-                    "closeup_frames": 0,
                     "recovery_frames": 0,
                     "last_fall_frame": -1000000,
                     "last_seen_frame": frame_index,
@@ -1203,28 +1149,6 @@ while True:
             side_lying_like = is_side_lying_pose(keypoints)
             true_lying_like = is_true_lying_geometry(keypoints)
             lower_body_geom_ok = has_reliable_lower_body_geometry(keypoints)
-            head_dominant_closeup = is_head_dominant_closeup(keypoints)
-
-            shoulders_visible = int(sum(1 for i in [5, 6] if keypoints[i][0] > 0 and keypoints[i][1] > 0))
-            hips_visible = int(sum(1 for i in [11, 12] if keypoints[i][0] > 0 and keypoints[i][1] > 0))
-            knees_visible = int(sum(1 for i in [13, 14] if keypoints[i][0] > 0 and keypoints[i][1] > 0))
-            ankles_visible = int(sum(1 for i in [15, 16] if keypoints[i][0] > 0 and keypoints[i][1] > 0))
-            nose = keypoints[0]
-            head_partial = (nose[0] <= 0 or nose[1] <= 0 or nose[1] < CLOSEUP_HEAD_TOP_EDGE_RATIO_TH * frame_h)
-
-            upper_body_closeup_like = (
-                (y_max > CLOSEUP_BOTTOM_RATIO_TH * frame_h)
-                and ((y_max - y_min) > CLOSEUP_MIN_HEIGHT_RATIO_TH * frame_h)
-                and (shoulders_visible >= 1)
-                and (hips_visible >= 1 or head_dominant_closeup)
-                and (ankles_visible == 0 or not lower_body_geom_ok)
-                and (head_dominant_closeup or head_partial or knees_visible == 0)
-            )
-
-            if upper_body_closeup_like:
-                state["closeup_frames"] += 1
-            else:
-                state["closeup_frames"] = 0
 
             if side_lying_like:
                 state["side_lying_frames"] += 1
@@ -1271,9 +1195,7 @@ while True:
                 horizontal_relax_ok = False
 
             # 半蹲仅在竖直姿态生效，避免侧躺抬腿被误当半蹲
-            non_fall_posture_like = (posture == "vertical" and (half_squat_like or sitting_like or kneeling_like or standing_support_like or head_dominant_closeup))
-            if upper_body_closeup_like:
-                non_fall_posture_like = True
+            non_fall_posture_like = (posture == "vertical" and (half_squat_like or sitting_like or kneeling_like or standing_support_like))
 
             # 高仰角时下半身缺失不允许触发；常规场景避免过度抑制导致漏检
             if high_uptilt_mode and not lower_body_ok:
@@ -1300,21 +1222,6 @@ while True:
             if (apply_uptilt_strict or high_uptilt_mode) and is_fall_event and not (head_feet_close or horizontal_relax_ok or side_lying_ready):
                 is_fall_event = False
 
-            # 近景半身抑制：头部占比过大时，不触发跌倒（存在躺地证据时放行）
-            if head_dominant_closeup and not (head_feet_close or horizontal_relax_ok or side_lying_ready):
-                is_fall_event = False
-
-            # 近景上半身/截头画面强抑制：直接阻断触发并快速清除历史红框
-            if upper_body_closeup_like:
-                is_fall_event = False
-                state["fall_confirm"] = 0
-                state["ground_timer"] = 0
-                state["low_center_timer"] = 0
-                if state["fall_state"] == "FALLEN" and state["closeup_frames"] >= CLOSEUP_CLEAR_FALL_FRAMES:
-                    state["fall_state"] = "NORMAL"
-                    state["fall_timer"] = 0
-                    state["recovery_frames"] = 0
-
             color = (0, 255, 0)
 
             # 2️⃣ 状态机（每个人独立）
@@ -1330,13 +1237,7 @@ while True:
             if state["horizontal_frames"] < MIN_HORIZONTAL_FRAMES_FOR_FALL:
                 is_fall_event = False
 
-            # 分场景门控：站立/过渡阶段要求下半身几何可靠；已呈现躺地证据时放宽几何门控
-            lying_evidence_for_gate = (head_feet_close or horizontal_relax_ok or side_lying_ready)
-            require_geom_gate = REQUIRE_LOWER_BODY_GEOMETRY_FOR_FALL and (not lying_evidence_for_gate)
-            lower_body_gate_ok = lower_body_ok and (lower_body_geom_ok if require_geom_gate else True)
-            can_enter_fall_state = lower_body_gate_ok if REQUIRE_LOWER_BODY_FOR_FALL else (lower_body_gate_ok or horizontal_relax_ok or side_lying_ready)
-
-            if can_enter_fall_state and not non_fall_posture_like and not upper_body_closeup_like:
+            if (lower_body_ok or horizontal_relax_ok or side_lying_ready) and not non_fall_posture_like:
                 # ✅ 2. 多帧确认：连续3帧 fall 才触发
                 if is_fall_event and not on_object:
                     state["fall_confirm"] += 1
@@ -1372,7 +1273,7 @@ while True:
                     and y_max > LOW_CENTER_BBOX_BOTTOM_RATIO_TH * frame_h
                     and not on_object
                 )
-                if low_center_like and (posture == "horizontal" or horizontal_relax_ok or side_lying_ready) and lower_body_gate_ok:
+                if low_center_like and (posture == "horizontal" or horizontal_relax_ok or side_lying_ready):
                     state["low_center_timer"] += 1
                     if state["low_center_timer"] > LOW_CENTER_HOLD_FRAMES and state["fall_state"] != "FALLEN":
                         state["fall_state"] = "FALLEN"
@@ -1387,8 +1288,7 @@ while True:
             else:
                 # 下半身不足或坐姿明显：不进行跌倒判定，清空触发计数
                 state["fall_confirm"] = 0
-                allow_no_lower_body_fallback = (not REQUIRE_LOWER_BODY_FOR_FALL) and (posture == "horizontal") and (horizontal_relax_ok or side_lying_ready)
-                if allow_no_lower_body_fallback and not non_fall_posture_like and not on_object:
+                if posture == "horizontal" and (horizontal_relax_ok or side_lying_ready) and not non_fall_posture_like and not on_object:
                     state["ground_timer"] += 1
                     if state["ground_timer"] > required_ground_frames and state["fall_state"] != "FALLEN":
                         state["fall_state"] = "FALLEN"
@@ -1408,8 +1308,7 @@ while True:
 
                 # 只有“可信躺倒”才延长红框，避免坐姿长期变红
                 fallen_evidence = (head_feet_close or horizontal_relax_ok or side_lying_ready)
-                keep_red_allowed = (lower_body_ok and not upper_body_closeup_like) if REQUIRE_LOWER_BODY_FOR_FALL else (not upper_body_closeup_like)
-                if keep_red_allowed and (posture == "horizontal" or side_lying_ready) and fallen_evidence and not sitting_like and not on_object:
+                if (posture == "horizontal" or side_lying_ready) and fallen_evidence and not sitting_like and not on_object:
                     state["fall_timer"] = FALL_HOLD_TIME
                     state["recovery_frames"] = 0
                 else:
