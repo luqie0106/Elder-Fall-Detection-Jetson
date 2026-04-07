@@ -1,0 +1,2 @@
+# 兼容入口：建议使用 requirements/face.txt
+-r requirements/face.txt

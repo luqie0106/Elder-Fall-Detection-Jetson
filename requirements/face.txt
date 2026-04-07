@@ -1,0 +1,4 @@
+# 人脸识别可选依赖（按需安装）
+# 说明：face_recognition 依赖 dlib，安装前请先准备编译环境
+
+face-recognition>=1.3.0

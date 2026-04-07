@@ -43,12 +43,12 @@ sudo jetson_clocks
 ### 运行检测
 
 ```bash
-python3 "detect040214(ori:040119).py"
+python3 "main.py"
 ```
 
 ### TensorRT 加速（推荐）
 
-为了获得最佳性能，建议将 `.pt` 模型导出为 `.engine`（TensorRT）格式：
+为了获得最佳性能，建议将 `.pt` 模型导出为 `.engine`（TensorRT）格式:
 
 ```python
 from ultralytics import YOLO
@@ -74,7 +74,7 @@ model = YOLO("yolov8n-pose.engine")
 
 ## ⚙️ 关键调参指南
 
-参数位于 `detect040214(ori:040119).py` 顶部，现场可按摄像头高度与视角调整：
+参数位于 `main.py` 顶部，现场可按摄像头高度与视角调整：
 
 | 需求 | 对应参数 | 调整建议 |
 |---|---|---|
@@ -85,7 +85,7 @@ model = YOLO("yolov8n-pose.engine")
 
 ## 📁 目录说明
 
-- `detect040214(ori:040119).py`：当前主版本（含动态透视补偿与侧身优化）
+- `main.py`：当前主版本（含动态透视补偿与侧身优化）
 - `yolov8n-pose.pt` / `yolov8n-pose.engine`：姿态模型权重
 - `bytetrack.yaml`：跟踪器配置文件（若工程中提供）
 
@@ -94,6 +94,143 @@ model = YOLO("yolov8n-pose.engine")
 - 光照影响：弱光环境关键点抖动可能导致误报，建议调高 `DETECTION_CONF_TH`
 - 遮挡处理：当下半身被床体大面积遮挡时稳定性会下降，脚本已通过 `LOWER_BODY_MIN_POINTS` 过滤
 - 屏幕翻拍视频与真实监控场景存在域差异，建议分场景建立参数模板
+
+## 🔔 外部接口与告警联动（新）
+
+项目已新增“跌倒事件外部接口”基础能力，采用模块化结构：
+
+- `services/event_pipeline.py`：统一事件管道（发送告警 + 写入数据库）
+- `services/notifier.py`：消息通道（控制台、Webhook，微信/电话为占位扩展）
+- `storage/events_db.py`：SQLite 事件存储
+- `web/app.py` + `web/templates/index.html`：HTML 页面查看历史告警
+- `config/alert_config.json`：告警通道配置
+
+### 1) 安装项目依赖（推荐）
+
+#### 通用环境（PC / 非 Jetson）
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+pip install -r requirements/base.txt
+```
+
+#### Jetson 环境（推荐）
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+pip install -r requirements/jetson.txt
+```
+
+Jetson 设备请保持系统预装 `torch/torchvision`，不要通过 pip 覆盖。
+
+### 2) 运行跌倒检测（已接入告警与入库）
+
+```bash
+python3 main.py
+```
+
+### 2.1 人脸识别（可选）
+
+你可以借助 `face_recognition` 项目完成老人身份识别：
+
+- 仓库：`https://github.com/ageitgey/face_recognition.git`
+- 本项目适配文件：`services/face_recognition_service.py`
+
+安装可选依赖：
+
+```bash
+pip install -r requirements/face.txt
+```
+
+兼容说明：根目录仍保留 `requirements.txt`、`requirements-jetson.txt`、`requirements-face.txt` 作为入口别名。
+
+启用后，系统会为识别到的人脸自动分配编号（如 `E001`、`E002`），并在告警记录里展示该编号。
+
+### 2.2 编号复用（A）与头像更新（B）
+
+当前逻辑已支持：
+
+- 首次看到一个新 `track_id` 时，立即分配临时编号（例如 `E003`），避免事件里长期显示“未识别”；
+- 后续按帧采样做人脸匹配，若命中历史老人，会自动切换为历史编号（编号复用）；
+- 头像会自动保存到 `web/static/faces/<elder_code>.jpg`，并基于清晰度/尺寸质量分做覆盖更新（更清晰则替换旧图）。
+
+这意味着：
+
+- 事件记录会更快出现“编号”；
+- 同一个人再次出现时，更容易复用原编号；
+- 网页中的头像会逐步变清晰，而不是固定首帧低质量截图。
+
+### 3) 启动网页查看告警记录
+
+```bash
+python3 web/app.py
+```
+
+浏览器访问：`http://127.0.0.1:5000`
+
+若提示端口被占用（`Address already in use`），可改端口启动：
+
+```bash
+FALL_WEB_PORT=5001 python3 web/app.py
+```
+
+若你使用项目虚拟环境，也可显式指定解释器：
+
+```bash
+FALL_WEB_PORT=5001 .venv/bin/python web/app.py
+```
+
+### 3.1 推荐启动命令（C）
+
+建议固定使用虚拟环境解释器，避免系统 Python 与依赖不一致：
+
+```bash
+cd /path/to/aix_contest
+.venv/bin/python web/app.py
+```
+
+若 `5000` 被占用：
+
+```bash
+cd /path/to/aix_contest
+FALL_WEB_PORT=5001 .venv/bin/python web/app.py
+```
+
+若仍失败，先检查端口占用再重启：
+
+```bash
+lsof -iTCP:5000 -sTCP:LISTEN
+lsof -iTCP:5001 -sTCP:LISTEN
+pkill -f "web/app.py"
+```
+
+改端口后访问：`http://127.0.0.1:5001`
+
+### 4) 配置微信/电话通道建议
+
+- 微信：推荐企业微信机器人 Webhook（可直接配置到 `config/alert_config.json` 的 `webhook.url`）
+- 电话：建议接 Twilio/阿里云语音外呼（在 `services/notifier.py` 的 phone_call 适配器中接入）
+
+> 说明：当前仓库默认开启控制台告警；Webhook/微信/电话默认关闭，避免误触发。
+
+### 5) 老人编号改姓名（网页）
+
+在网页首页的“老人编号与姓名”表格中，可直接将 `E001/E002...` 修改为真实姓名并保存。
+修改结果会写入 SQLite，后续告警记录会显示姓名。
+
+## 📄 第三方许可证说明
+
+本项目包含对第三方库（如 `face_recognition`）的依赖调用。
+
+- 本项目许可证：见根目录 `LICENSE`（Apache-2.0）
+- 第三方依赖与许可证信息：见 `THIRD_PARTY_NOTICES.md`
+
+如果你仅“依赖安装并调用 API”，通常无需把第三方项目的 LICENSE 文件复制到本仓库；
+若你直接拷贝了第三方源码片段，请按其许可证要求保留对应版权与许可声明。
 
 本项目为 AIX 比赛开发版本，建议结合 `jtop` 实时监控显存、温度与功耗。
 

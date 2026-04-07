@@ -1,0 +1,20 @@
+{
+  "console": {
+    "enabled": true
+  },
+  "webhook": {
+    "enabled": false,
+    "url": "",
+    "timeout_sec": 4
+  },
+  "weixin": {
+    "enabled": false,
+    "mode": "wecom_webhook",
+    "note": "建议配置企业微信机器人 Webhook"
+  },
+  "phone_call": {
+    "enabled": false,
+    "provider": "twilio",
+    "note": "占位配置，后续接 Twilio/阿里云语音外呼"
+  }
+}

@@ -1,0 +1,2 @@
+# 兼容入口：建议使用 requirements/jetson.txt
+-r requirements/jetson.txt

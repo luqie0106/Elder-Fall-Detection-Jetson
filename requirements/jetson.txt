@@ -1,0 +1,8 @@
+# Jetson 专用依赖清单
+# 说明：不要在 Jetson 上通过 pip 覆盖系统预装 torch/torchvision
+# 建议保留 JetPack 自带 PyTorch 版本，仅安装以下项目依赖
+
+numpy>=1.24.0
+opencv-python>=4.8.0
+flask>=3.0.0
+ultralytics>=8.3.0

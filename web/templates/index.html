@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>跌倒告警面板</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #f7f8fa; margin: 0; padding: 20px; }
+    .card { background: #fff; border-radius: 10px; padding: 16px; margin-bottom: 16px; box-shadow: 0 2px 8px rgba(0,0,0,.06); }
+    h1 { margin: 0 0 12px 0; font-size: 22px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #eceff3; font-size: 14px; }
+    th { background: #fafbfc; }
+    .muted { color: #666; }
+    .elder-cell { display: flex; align-items: center; gap: 10px; }
+    .avatar { width: 40px; height: 40px; border-radius: 6px; object-fit: cover; border: 1px solid #dde3ea; background: #f3f5f8; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>跌倒事件概览</h1>
+    <div>最近7天累计：<strong>{{ total }}</strong> 次</div>
+    <div class="muted">当前展示最近 {{ limit }} 条记录</div>
+  </div>
+
+  <div class="card">
+    <h1>老人编号与姓名</h1>
+    <table>
+      <thead>
+        <tr><th>编号 / 头像</th><th>姓名</th><th>修改</th></tr>
+      </thead>
+      <tbody>
+        {% for p in elders %}
+        <tr>
+          <td>
+            <div class="elder-cell">
+              {% if p.avatar_path %}
+              <img class="avatar" src="{{ p.avatar_path }}" alt="{{ p.elder_code }}" />
+              {% else %}
+              <div class="avatar"></div>
+              {% endif %}
+              <span>{{ p.elder_code }}</span>
+            </div>
+          </td>
+          <td>{{ p.elder_name if p.elder_name else '（未命名）' }}</td>
+          <td>
+            <form method="post" action="/elders/rename" style="display:flex; gap:8px; align-items:center;">
+              <input type="hidden" name="elder_code" value="{{ p.elder_code }}" />
+              <input type="text" name="elder_name" value="{{ p.elder_name if p.elder_name else '' }}" placeholder="输入姓名" />
+              <button type="submit">保存</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h1>近7天统计</h1>
+    <table>
+      <thead><tr><th>日期</th><th>次数</th></tr></thead>
+      <tbody>
+        {% for item in counts %}
+        <tr><td>{{ item.day }}</td><td>{{ item.total }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h1>最近告警记录</h1>
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th><th>时间</th><th>老人</th><th>摄像头</th><th>帧号</th><th>中心点</th><th>通道状态</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for e in events %}
+        <tr>
+          <td>{{ e.id }}</td>
+          <td>{{ e.event_time }}</td>
+          <td>
+            {% if e.elder_code %}
+            <div class="elder-cell">
+              {% if e.avatar_path %}
+              <img class="avatar" src="{{ e.avatar_path }}" alt="{{ e.elder_code }}" />
+              {% else %}
+              <div class="avatar"></div>
+              {% endif %}
+              <span>{{ e.elder_name }}（{{ e.elder_code }}）</span>
+            </div>
+            {% else %}
+            {{ e.elder_name }}
+            {% endif %}
+          </td>
+          <td>{{ e.camera_id }}</td>
+          <td>{{ e.frame_idx }}</td>
+          <td>({{ '%.1f'|format(e.cx) }}, {{ '%.1f'|format(e.cy) }})</td>
+          <td>{{ e.channel_status }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>

@@ -3,9 +3,37 @@ import cv2
 import numpy as np
 import math
 import time
+from pathlib import Path
+
+try:
+    from services.event_pipeline import report_fall_event
+except Exception:
+    report_fall_event = None
+
+try:
+    from services.face_recognition_service import get_default_face_service
+except Exception:
+    get_default_face_service = None
+
+try:
+    from storage.events_db import ensure_elder, update_elder_avatar
+except Exception:
+    ensure_elder = None
+    update_elder_avatar = None
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_DB_PATH = str(PROJECT_ROOT / "data" / "fall_events.db")
+FACES_DIR = PROJECT_ROOT / "web" / "static" / "faces"
 
 # 加载模型（一个模型同时支持检测+pose）
 model = YOLO("yolov8n-pose.pt")
+
+face_service = None
+if get_default_face_service is not None:
+    try:
+        face_service = get_default_face_service()
+    except Exception:
+        face_service = None
 
 
 cap = cv2.VideoCapture(0)
@@ -105,6 +133,14 @@ CLOSEUP_BOTTOM_RATIO_TH = 0.88
 CLOSEUP_MIN_HEIGHT_RATIO_TH = 0.40
 CLOSEUP_HEAD_TOP_EDGE_RATIO_TH = 0.06
 CLOSEUP_CLEAR_FALL_FRAMES = 2
+
+# 人脸识别采样间隔（帧）
+FACE_RECOG_INTERVAL = 15
+# 人脸绑定最多尝试次数（每个track）
+FACE_BIND_MAX_TRIES = 6
+# 头像更新：最小质量分与提升阈值
+AVATAR_MIN_SCORE = 0.18
+AVATAR_UPDATE_SCORE_MARGIN = 0.06
 
 # 坐姿门控（用于抑制坐姿误报）
 # 躯干纵向占优比例阈值（调大更紧，不易判坐姿）
@@ -953,7 +989,7 @@ def is_duplicate_person_bbox(box_a, box_b, frame_w, frame_h):
 
     return False
 
-def try_register_fall_event(bbox, cx, cy, frame_w, frame_h, frame_idx):
+def try_register_fall_event(bbox, cx, cy, frame_w, frame_h, frame_idx, elder_code=""):
     # 基于时间 + 空间去重：同一人同一次倒地只记一次
     global fall_count
 
@@ -976,7 +1012,108 @@ def try_register_fall_event(bbox, cx, cy, frame_w, frame_h, frame_idx):
         "bbox": bbox,
     })
     fall_count += 1
+
+    if report_fall_event is not None:
+        try:
+            report_fall_event({
+                "event_time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "camera_id": "home-cam-0",
+                "frame_idx": int(frame_idx),
+                "cx": float(cx),
+                "cy": float(cy),
+                "bbox": [float(v) for v in bbox],
+                "elder_code": str(elder_code or ""),
+            })
+        except Exception as error:
+            print(f"[WARN] 外部告警/入库失败: {error}")
+
     return True
+
+
+def allocate_elder_code() -> str:
+    if ensure_elder is None:
+        return ""
+    try:
+        elder = ensure_elder(DEFAULT_DB_PATH, None)
+        return str(elder.get("elder_code") or "")
+    except Exception:
+        return ""
+
+
+def _compute_avatar_score(face_crop, valid_face_points: int) -> float:
+    h, w = face_crop.shape[:2]
+    if h <= 0 or w <= 0:
+        return 0.0
+
+    gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
+    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    sharp_norm = min(1.0, sharpness / 280.0)
+    size_norm = min(1.0, (w * h) / float(140 * 140))
+    face_bonus = 1.0 if valid_face_points >= 3 else 0.72
+    return (0.58 * size_norm + 0.42 * sharp_norm) * face_bonus
+
+
+def save_elder_avatar(frame, keypoints, bbox, elder_code: str, state: dict) -> None:
+    if not elder_code or update_elder_avatar is None:
+        return
+
+    face_points = keypoints[0:5]
+    valid_face = face_points[(face_points[:, 0] > 0) & (face_points[:, 1] > 0)]
+
+    if len(valid_face) >= 2:
+        fx_min, fy_min = valid_face.min(axis=0)
+        fx_max, fy_max = valid_face.max(axis=0)
+        face_w = max(24.0, fx_max - fx_min)
+        face_h = max(24.0, fy_max - fy_min)
+
+        cx = (fx_min + fx_max) / 2.0
+        cy = (fy_min + fy_max) / 2.0
+        x1 = int(cx - 1.2 * face_w)
+        x2 = int(cx + 1.2 * face_w)
+        y1 = int(cy - 1.3 * face_h)
+        y2 = int(cy + 1.7 * face_h)
+    else:
+        x_min, y_min, x_max, y_max = bbox
+        body_w = max(24.0, x_max - x_min)
+        body_h = max(24.0, y_max - y_min)
+        x1 = int(x_min + 0.18 * body_w)
+        x2 = int(x_max - 0.18 * body_w)
+        y1 = int(y_min)
+        y2 = int(y_min + 0.48 * body_h)
+
+    h, w = frame.shape[:2]
+    x1 = max(0, min(w - 1, x1))
+    x2 = max(0, min(w, x2))
+    y1 = max(0, min(h - 1, y1))
+    y2 = max(0, min(h, y2))
+
+    if x2 - x1 < 20 or y2 - y1 < 20:
+        return
+
+    face_crop = frame[y1:y2, x1:x2]
+    if face_crop.size == 0:
+        return
+
+    score = _compute_avatar_score(face_crop, int(len(valid_face)))
+    if score < AVATAR_MIN_SCORE:
+        return
+
+    prev_score = float(state.get("avatar_best_score", 0.0) or 0.0)
+    should_update = (not state.get("avatar_saved")) or (score > prev_score + AVATAR_UPDATE_SCORE_MARGIN)
+    if not should_update:
+        return
+
+    FACES_DIR.mkdir(parents=True, exist_ok=True)
+    file_path = FACES_DIR / f"{elder_code}.jpg"
+    ok = cv2.imwrite(str(file_path), face_crop)
+    if not ok:
+        return
+
+    avatar_path = f"/static/faces/{elder_code}.jpg"
+    if update_elder_avatar(DEFAULT_DB_PATH, elder_code, avatar_path):
+        state["avatar_saved"] = True
+        state["avatar_path"] = avatar_path
+        state["avatar_best_score"] = score
 
 while True:
     frame_start_t = time.perf_counter()
@@ -1138,6 +1275,7 @@ while True:
             active_track_ids.add(track_id)
 
             if track_id not in person_states:
+                initial_elder_code = allocate_elder_code()
                 person_states[track_id] = {
                     "history": [],
                     "fall_state": "NORMAL",
@@ -1151,6 +1289,12 @@ while True:
                     "horizontal_frames": 0,
                     "side_lying_frames": 0,
                     "closeup_frames": 0,
+                    "elder_code": initial_elder_code,
+                    "face_bind_done": False,
+                    "face_bind_tries": 0,
+                    "avatar_saved": False,
+                    "avatar_path": "",
+                    "avatar_best_score": 0.0,
                     "recovery_frames": 0,
                     "last_fall_frame": -1000000,
                     "last_seen_frame": frame_index,
@@ -1161,6 +1305,38 @@ while True:
                 state["cooldown_timer"] -= 1
             state["seen_frames"] += 1
             state["last_seen_frame"] = frame_index
+
+            if face_service is not None and getattr(face_service, "available", False) and frame_index % FACE_RECOG_INTERVAL == 0:
+                try:
+                    x1 = max(0, int(x_min))
+                    y1 = max(0, int(y_min))
+                    x2 = min(frame.shape[1], int(x_max))
+                    y2 = min(frame.shape[0], int(y_max))
+                    if x2 - x1 > 20 and y2 - y1 > 20:
+                        face_roi = frame[y1:y2, x1:x2]
+                        matched_code = None
+                        if hasattr(face_service, "identify_only"):
+                            matched_code = face_service.identify_only(face_roi)
+
+                        if matched_code:
+                            matched_code = str(matched_code)
+                            if matched_code != str(state.get("elder_code") or ""):
+                                state["elder_code"] = matched_code
+                                state["avatar_saved"] = False
+                                state["avatar_best_score"] = 0.0
+                            state["face_bind_done"] = True
+                        else:
+                            current_code = str(state.get("elder_code") or "")
+                            bind_tries = int(state.get("face_bind_tries", 0) or 0)
+                            if current_code and (not state.get("face_bind_done")) and bind_tries < FACE_BIND_MAX_TRIES and hasattr(face_service, "attach_face_to_elder"):
+                                bound = bool(face_service.attach_face_to_elder(face_roi, current_code))
+                                state["face_bind_tries"] = bind_tries + 1
+                                if bound:
+                                    state["face_bind_done"] = True
+                except Exception:
+                    pass
+
+            save_elder_avatar(frame, keypoints, person["bbox"], str(state.get("elder_code") or ""), state)
 
             # 1️⃣ 基础信息
             posture = get_posture(keypoints, dyn_horizontal_th)
@@ -1349,7 +1525,7 @@ while True:
                     state["last_fall_frame"] = frame_index
                     state["recovery_frames"] = 0
                     if state["cooldown_timer"] <= 0:
-                        try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index)
+                        try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index, state.get("elder_code", ""))
                         state["cooldown_timer"] = FALL_RECOUNT_COOLDOWN_FRAMES
 
                 # ✅ 改4：持续躺地判断（防漏检）
@@ -1361,7 +1537,7 @@ while True:
                         state["last_fall_frame"] = frame_index
                         state["recovery_frames"] = 0
                         if state["cooldown_timer"] <= 0:
-                            try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index)
+                            try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index, state.get("elder_code", ""))
                             state["cooldown_timer"] = FALL_RECOUNT_COOLDOWN_FRAMES
                 else:
                     state["ground_timer"] = 0
@@ -1380,7 +1556,7 @@ while True:
                         state["last_fall_frame"] = frame_index
                         state["recovery_frames"] = 0
                         if state["cooldown_timer"] <= 0:
-                            try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index)
+                            try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index, state.get("elder_code", ""))
                             state["cooldown_timer"] = FALL_RECOUNT_COOLDOWN_FRAMES
                 else:
                     state["low_center_timer"] = 0
@@ -1396,7 +1572,7 @@ while True:
                         state["last_fall_frame"] = frame_index
                         state["recovery_frames"] = 0
                         if state["cooldown_timer"] <= 0:
-                            try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index)
+                            try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index, state.get("elder_code", ""))
                             state["cooldown_timer"] = FALL_RECOUNT_COOLDOWN_FRAMES
                 else:
                     state["ground_timer"] = 0
