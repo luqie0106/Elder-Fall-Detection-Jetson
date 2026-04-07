@@ -1,7 +1,7 @@
 # Elder Fall Detection (AI) - Jetson Orin NX 版
 
 基于 YOLOv8 Pose 的老年人跌倒检测项目，针对 NVIDIA Jetson Orin NX 边缘开发板进行深度优化。  
-当前推荐脚本版本：`detect040214(ori:040119).py`。
+当前推荐脚本版本：`main.py`。
 
 ## 🌟 项目简介
 
