@@ -228,7 +228,9 @@ def list_recent_events(db_path: str, limit: int = 100) -> list[dict[str, Any]]:
             extra = json.loads(item.pop("extra_json") or "{}")
         except json.JSONDecodeError:
             extra = {}
+        item["alert_level"] = str(extra.get("alert_level") or "confirmed")
         item["snapshot_path"] = str(extra.get("snapshot_path") or "")
+        item["video_path"] = str(extra.get("video_path") or "")
         code = str(item.get("elder_code") or "").strip()
         if code:
             elder_info = elder_map.get(code, {})

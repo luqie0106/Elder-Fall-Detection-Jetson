@@ -29,7 +29,7 @@
     <table>
       <thead>
         <tr>
-          <th>ID</th><th>时间</th><th>截图</th><th>摄像头</th><th>帧号</th><th>中心点</th><th>通道状态</th>
+          <th>ID</th><th>时间</th><th>级别</th><th>截图</th><th>视频</th><th>摄像头</th><th>帧号</th><th>中心点</th><th>通道状态</th>
         </tr>
       </thead>
       <tbody>
@@ -37,11 +37,19 @@
         <tr>
           <td>{{ e.id }}</td>
           <td>{{ e.event_time }}</td>
+          <td>{{ e.alert_level }}</td>
           <td>
             {% if e.snapshot_path %}
             <a href="{{ e.snapshot_path }}" target="_blank" rel="noopener noreferrer">
               <img class="snapshot" src="{{ e.snapshot_path }}" alt="fall-{{ e.id }}" />
             </a>
+            {% else %}
+            -
+            {% endif %}
+          </td>
+          <td>
+            {% if e.video_path %}
+            <a href="{{ e.video_path }}" target="_blank" rel="noopener noreferrer">查看视频</a>
             {% else %}
             -
             {% endif %}

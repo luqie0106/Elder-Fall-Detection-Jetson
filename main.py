@@ -3,7 +3,10 @@ import cv2
 import numpy as np
 import math
 import time
+import os
+import threading
 from pathlib import Path
+from collections import deque
 
 try:
     from services.event_pipeline import report_fall_event
@@ -36,7 +39,56 @@ if get_default_face_service is not None:
         face_service = None
 
 
-cap = cv2.VideoCapture(0)
+def _parse_camera_sources() -> list[str | int]:
+    raw = str(os.getenv("FALL_CAMERA_SOURCES", "0")).strip()
+    if not raw:
+        return [0]
+    parts = [item.strip() for item in raw.split(",") if item.strip()]
+    result: list[str | int] = []
+    for part in parts:
+        if part.lstrip("-").isdigit():
+            result.append(int(part))
+        else:
+            result.append(part)
+    return result or [0]
+
+
+CAMERA_SOURCES = _parse_camera_sources()
+camera_entries: list[dict] = []
+for index, source in enumerate(CAMERA_SOURCES):
+    cap = cv2.VideoCapture(source)
+    if cap is not None and cap.isOpened():
+        camera_entries.append({
+            "camera_key": f"cam-{index}",
+            "camera_source": source,
+            "capture": cap,
+        })
+
+if not camera_entries:
+    raise RuntimeError("没有可用摄像头，请检查 FALL_CAMERA_SOURCES 配置。")
+
+camera_latest_frames: dict[str, np.ndarray | None] = {entry["camera_key"]: None for entry in camera_entries}
+camera_locks: dict[str, threading.Lock] = {entry["camera_key"]: threading.Lock() for entry in camera_entries}
+camera_stop_event = threading.Event()
+
+
+def _camera_capture_worker(entry: dict) -> None:
+    camera_key = str(entry["camera_key"])
+    capture = entry["capture"]
+    while not camera_stop_event.is_set():
+        ret, frame = capture.read()
+        if not ret:
+            time.sleep(0.02)
+            continue
+        with camera_locks[camera_key]:
+            camera_latest_frames[camera_key] = frame
+
+
+camera_threads: list[threading.Thread] = []
+for entry in camera_entries:
+    t = threading.Thread(target=_camera_capture_worker, args=(entry,), daemon=True)
+    t.start()
+    camera_threads.append(t)
 
 # 时间序列缓存（每个人独立）
 MAX_HISTORY = 10
@@ -45,6 +97,12 @@ MAX_HISTORY = 10
 fall_count = 0
 person_count = 0
 FALL_HOLD_TIME = 30  # 保持红框30帧（约1秒）
+UNRECOVERED_ALERT_FRAMES = 120
+
+EVENT_CLIP_PRE_SECONDS = max(3, min(5, int(os.getenv("FALL_CLIP_PRE_SECONDS", "3"))))
+EVENT_CLIP_POST_SECONDS = max(3, min(5, int(os.getenv("FALL_CLIP_POST_SECONDS", "3"))))
+EVENT_CLIP_FPS = 15
+TRACK_PERSIST = len(camera_entries) <= 1
 
 # =====================
 # 可调阈值（调参指南）
@@ -187,7 +245,7 @@ BASE_HEAD_DROP_IGNORE_TH = 5
 
 # 状态机触发阈值
 # 连续fall确认帧数（调大更紧）
-FALL_CONFIRM_FRAMES = 1
+FALL_CONFIRM_FRAMES = 2
 # 仰角场景下更严格确认帧数
 UPTILT_FALL_CONFIRM_FRAMES = 3
 # 持续躺地触发帧数（调大更紧）
@@ -269,6 +327,13 @@ fps_ema = 0.0
 FPS_EMA_ALPHA = 0.2
 inference_ms = 0.0
 frame_ms = 0.0
+
+camera_frame_buffers = {
+    entry["camera_key"]: deque(maxlen=max(1, EVENT_CLIP_PRE_SECONDS * EVENT_CLIP_FPS))
+    for entry in camera_entries
+}
+camera_pending_clips = {entry["camera_key"]: [] for entry in camera_entries}
+camera_fall_counts = {entry["camera_key"]: 0 for entry in camera_entries}
 
 def get_posture(keypoints, horizontal_ratio_th):
     valid_xy = keypoints[(keypoints[:, 0] > 0) & (keypoints[:, 1] > 0)]
@@ -1013,42 +1078,110 @@ def save_fall_snapshot(frame, frame_idx: int, elder_code: str = "") -> str:
         return ""
 
 
-def try_register_fall_event(bbox, cx, cy, frame_w, frame_h, frame_idx, elder_code="", frame=None):
+def _write_clip_file(frames: list, file_path: Path, fps: int) -> bool:
+    if not frames:
+        return False
+    h, w = frames[0].shape[:2]
+    writer = cv2.VideoWriter(str(file_path), cv2.VideoWriter_fourcc(*"mp4v"), float(max(1, fps)), (int(w), int(h)))
+    if not writer.isOpened():
+        return False
+    for frame in frames:
+        writer.write(frame)
+    writer.release()
+    return True
+
+
+def update_pending_event_clips(camera_key: str, frame) -> None:
+    pending = camera_pending_clips.get(camera_key, [])
+    if not pending:
+        return
+
+    done_indexes = []
+    for idx, item in enumerate(pending):
+        item["frames"].append(frame.copy())
+        item["post_left"] -= 1
+        if item["post_left"] <= 0:
+            _write_clip_file(item["frames"], item["file_path"], EVENT_CLIP_FPS)
+            done_indexes.append(idx)
+
+    for idx in reversed(done_indexes):
+        pending.pop(idx)
+
+
+def enqueue_event_clip(camera_key: str, frame_idx: int, elder_code: str = "") -> str:
+    FACES_DIR.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    code_part = str(elder_code or "unknown").strip() or "unknown"
+    file_name = f"fall_{camera_key}_{ts}_{int(frame_idx):06d}_{code_part}.mp4"
+    file_path = FACES_DIR / file_name
+    url_path = f"/static/faces/{file_name}"
+
+    pre_frames = [f.copy() for f in list(camera_frame_buffers.get(camera_key, []))]
+    camera_pending_clips[camera_key].append({
+        "file_path": file_path,
+        "frames": pre_frames,
+        "post_left": max(1, EVENT_CLIP_POST_SECONDS * EVENT_CLIP_FPS),
+    })
+    return url_path
+
+
+def try_register_fall_event(bbox, cx, cy, frame_w, frame_h, frame_idx, elder_code="", frame=None, camera_id="cam-0", alert_level="confirmed"):
     # 基于时间 + 空间去重：同一人同一次倒地只记一次
     global fall_count
 
+    level_rank_map = {"suspected": 1, "confirmed": 2, "unrecovered": 3}
+    level_rank = int(level_rank_map.get(str(alert_level), 2))
+
     max_dist = EVENT_DEDUP_CENTER_DIST_RATIO * max(frame_w, frame_h)
+    same_event_idx = -1
     for event in recent_fall_events:
+        if str(event.get("camera_id") or "") != str(camera_id):
+            continue
         if frame_idx - event["frame"] > EVENT_DEDUP_FRAMES:
             continue
 
         prev_cx, prev_cy = event["center"]
         center_dist = math.hypot(cx - prev_cx, cy - prev_cy)
-        if center_dist <= max_dist:
-            return False
+        near_same = (center_dist <= max_dist) or (bbox_iou(bbox, event["bbox"]) >= EVENT_DEDUP_IOU_TH)
+        if near_same:
+            prev_rank = int(event.get("level_rank", 0) or 0)
+            if level_rank <= prev_rank:
+                return False
+            same_event_idx = recent_fall_events.index(event)
+            break
 
-        if bbox_iou(bbox, event["bbox"]) >= EVENT_DEDUP_IOU_TH:
-            return False
+    if same_event_idx >= 0:
+        recent_fall_events[same_event_idx]["frame"] = frame_idx
+        recent_fall_events[same_event_idx]["center"] = (float(cx), float(cy))
+        recent_fall_events[same_event_idx]["bbox"] = bbox
+        recent_fall_events[same_event_idx]["level_rank"] = level_rank
+    else:
+        recent_fall_events.append({
+            "frame": frame_idx,
+            "center": (float(cx), float(cy)),
+            "bbox": bbox,
+            "camera_id": str(camera_id),
+            "level_rank": level_rank,
+        })
 
-    recent_fall_events.append({
-        "frame": frame_idx,
-        "center": (float(cx), float(cy)),
-        "bbox": bbox,
-    })
     fall_count += 1
+    camera_fall_counts[str(camera_id)] = camera_fall_counts.get(str(camera_id), 0) + 1
     snapshot_path = save_fall_snapshot(frame, frame_idx, str(elder_code or ""))
+    video_path = enqueue_event_clip(str(camera_id), frame_idx, str(elder_code or ""))
 
     if report_fall_event is not None:
         try:
             report_fall_event({
                 "event_time": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                "camera_id": "home-cam-0",
+                "camera_id": str(camera_id),
                 "frame_idx": int(frame_idx),
                 "cx": float(cx),
                 "cy": float(cy),
                 "bbox": [float(v) for v in bbox],
                 "elder_code": str(elder_code or ""),
+                "alert_level": str(alert_level),
                 "snapshot_path": snapshot_path,
+                "video_path": video_path,
             })
         except Exception as error:
             print(f"[WARN] 外部告警/入库失败: {error}")
@@ -1066,14 +1199,14 @@ def allocate_elder_code() -> str:
         return ""
 
 
-def prune_recent_identity_pool(current_frame: int) -> None:
+def prune_recent_identity_pool(current_frame: int, camera_key: str | None = None) -> None:
     recent_identity_pool[:] = [
         item for item in recent_identity_pool
         if current_frame - int(item.get("frame", current_frame)) <= RECENT_IDENTITY_MAX_AGE_FRAMES
     ]
 
 
-def push_recent_identity(elder_code: str, cx: float, cy: float, current_frame: int) -> None:
+def push_recent_identity(elder_code: str, cx: float, cy: float, current_frame: int, camera_key: str) -> None:
     code = str(elder_code or "").strip()
     if not code:
         return
@@ -1084,12 +1217,13 @@ def push_recent_identity(elder_code: str, cx: float, cy: float, current_frame: i
         "cx": float(cx),
         "cy": float(cy),
         "frame": int(current_frame),
+        "camera_key": str(camera_key),
     })
     if len(recent_identity_pool) > RECENT_IDENTITY_POOL_MAX:
         recent_identity_pool[:] = recent_identity_pool[-RECENT_IDENTITY_POOL_MAX:]
 
 
-def try_reuse_recent_identity(cx: float, cy: float, frame_w: int, frame_h: int, current_frame: int) -> str:
+def try_reuse_recent_identity(cx: float, cy: float, frame_w: int, frame_h: int, current_frame: int, camera_key: str) -> str:
     prune_recent_identity_pool(current_frame)
     if not recent_identity_pool:
         return ""
@@ -1099,6 +1233,8 @@ def try_reuse_recent_identity(cx: float, cy: float, frame_w: int, frame_h: int, 
     best_dist = 1e12
 
     for idx, item in enumerate(recent_identity_pool):
+        if str(item.get("camera_key") or "") != str(camera_key):
+            continue
         dx = float(cx) - float(item.get("cx", 0.0))
         dy = float(cy) - float(item.get("cy", 0.0))
         dist = math.hypot(dx, dy)
@@ -1197,6 +1333,14 @@ def save_elder_avatar(frame, keypoints, bbox, elder_code: str, state: dict) -> N
         state["avatar_best_score"] = score
 
 while True:
+    if not camera_entries:
+        break
+
+    current_camera_idx = frame_index % len(camera_entries)
+    current_entry = camera_entries[current_camera_idx]
+    camera_key = str(current_entry["camera_key"])
+    cap = current_entry["capture"]
+
     frame_start_t = time.perf_counter()
     frame_index += 1
 
@@ -1204,17 +1348,23 @@ while True:
     recent_fall_events[:] = [
         e for e in recent_fall_events if frame_index - e["frame"] <= EVENT_DEDUP_FRAMES
     ]
-    prune_recent_identity_pool(frame_index)
+    prune_recent_identity_pool(frame_index, camera_key)
 
-    ret, frame = cap.read()
-    if not ret:
-        break
+    with camera_locks[camera_key]:
+        latest = camera_latest_frames.get(camera_key)
+        frame = latest.copy() if latest is not None else None
+    if frame is None:
+        time.sleep(0.005)
+        continue
+
+    camera_frame_buffers[camera_key].append(frame.copy())
+    update_pending_event_clips(camera_key, frame)
 
     estimated_pitch = CAMERA_PITCH_ANGLE
 
     # 使用 ByteTrack 进行目标跟踪，保证每个人独立 history
     infer_start_t = time.perf_counter()
-    results = model.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False)[0]
+    results = model.track(frame, persist=TRACK_PERSIST, tracker="bytetrack.yaml", verbose=False)[0]
     infer_end_t = time.perf_counter()
 
     if hasattr(results, "speed") and isinstance(results.speed, dict):
@@ -1260,7 +1410,8 @@ while True:
 
         for idx, k in enumerate(results.keypoints.xy):
             keypoints = k.cpu().numpy()
-            track_id = track_ids[idx] if track_ids is not None and idx < len(track_ids) else idx
+            raw_track_id = track_ids[idx] if track_ids is not None and idx < len(track_ids) else idx
+            track_id = (camera_key, int(raw_track_id))
 
             if not valid_person(keypoints):
                 continue
@@ -1359,7 +1510,7 @@ while True:
             active_track_ids.add(track_id)
 
             if track_id not in person_states:
-                initial_elder_code = try_reuse_recent_identity(cx, cy, frame_w, frame_h, frame_index)
+                initial_elder_code = try_reuse_recent_identity(cx, cy, frame_w, frame_h, frame_index, camera_key)
                 if not initial_elder_code:
                     initial_elder_code = allocate_elder_code()
                 person_states[track_id] = {
@@ -1386,6 +1537,8 @@ while True:
                     "last_seen_frame": frame_index,
                     "last_center": (float(cx), float(cy)),
                     "last_bbox": [float(x_min), float(y_min), float(x_max), float(y_max)],
+                    "suspected_sent": False,
+                    "unrecovered_sent": False,
                 }
 
             state = person_states[track_id]
@@ -1600,13 +1753,20 @@ while True:
                 else:
                     state["fall_confirm"] = 0
 
+                suspect_threshold = max(1, required_confirm_frames - 1)
+                if required_confirm_frames >= 2 and state["fall_confirm"] == suspect_threshold and state["fall_state"] != "FALLEN" and not state.get("suspected_sent"):
+                    if state["cooldown_timer"] <= 0:
+                        try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index, state.get("elder_code", ""), frame, camera_key, "suspected")
+                    state["suspected_sent"] = True
+
                 if state["fall_confirm"] >= required_confirm_frames and state["fall_state"] != "FALLEN":
                     state["fall_state"] = "FALLEN"
                     state["fall_timer"] = FALL_HOLD_TIME
                     state["last_fall_frame"] = frame_index
                     state["recovery_frames"] = 0
+                    state["unrecovered_sent"] = False
                     if state["cooldown_timer"] <= 0:
-                        try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index, state.get("elder_code", ""), frame)
+                        try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index, state.get("elder_code", ""), frame, camera_key, "confirmed")
                         state["cooldown_timer"] = FALL_RECOUNT_COOLDOWN_FRAMES
 
                 # ✅ 改4：持续躺地判断（防漏检）
@@ -1617,8 +1777,9 @@ while True:
                         state["fall_timer"] = FALL_HOLD_TIME
                         state["last_fall_frame"] = frame_index
                         state["recovery_frames"] = 0
+                        state["unrecovered_sent"] = False
                         if state["cooldown_timer"] <= 0:
-                            try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index, state.get("elder_code", ""), frame)
+                            try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index, state.get("elder_code", ""), frame, camera_key, "confirmed")
                             state["cooldown_timer"] = FALL_RECOUNT_COOLDOWN_FRAMES
                 else:
                     state["ground_timer"] = 0
@@ -1636,8 +1797,9 @@ while True:
                         state["fall_timer"] = FALL_HOLD_TIME
                         state["last_fall_frame"] = frame_index
                         state["recovery_frames"] = 0
+                        state["unrecovered_sent"] = False
                         if state["cooldown_timer"] <= 0:
-                            try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index, state.get("elder_code", ""), frame)
+                            try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index, state.get("elder_code", ""), frame, camera_key, "confirmed")
                             state["cooldown_timer"] = FALL_RECOUNT_COOLDOWN_FRAMES
                 else:
                     state["low_center_timer"] = 0
@@ -1652,8 +1814,9 @@ while True:
                         state["fall_timer"] = FALL_HOLD_TIME
                         state["last_fall_frame"] = frame_index
                         state["recovery_frames"] = 0
+                        state["unrecovered_sent"] = False
                         if state["cooldown_timer"] <= 0:
-                            try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index, state.get("elder_code", ""), frame)
+                            try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index, state.get("elder_code", ""), frame, camera_key, "confirmed")
                             state["cooldown_timer"] = FALL_RECOUNT_COOLDOWN_FRAMES
                 else:
                     state["ground_timer"] = 0
@@ -1684,6 +1847,11 @@ while True:
                     state["fall_state"] = "NORMAL"
                     state["fall_confirm"] = 0
 
+                if state["fall_state"] == "FALLEN" and (frame_index - state.get("last_fall_frame", frame_index)) >= UNRECOVERED_ALERT_FRAMES and not state.get("unrecovered_sent"):
+                    if state["cooldown_timer"] <= 0:
+                        try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index, state.get("elder_code", ""), frame, camera_key, "unrecovered")
+                    state["unrecovered_sent"] = True
+
             # 5️⃣ 可视化
             for x, y in keypoints:
                 cv2.circle(frame, (int(x), int(y)), 3, (255, 0, 0), -1)
@@ -1696,7 +1864,7 @@ while True:
     # 清理已消失目标，防止状态无限增长
     stale_ids = [
         tid for tid, s in person_states.items()
-        if tid not in active_track_ids and frame_index - s.get("last_seen_frame", frame_index) > TRACK_STATE_TTL_FRAMES
+        if tid not in active_track_ids and isinstance(tid, tuple) and str(tid[0]) == camera_key and frame_index - s.get("last_seen_frame", frame_index) > TRACK_STATE_TTL_FRAMES
     ]
     for tid in stale_ids:
         stale_state = person_states.pop(tid, None)
@@ -1707,13 +1875,13 @@ while True:
         if elder_code and isinstance(center, tuple) and len(center) == 2:
             c0, c1 = center
             if c0 is not None and c1 is not None:
-                push_recent_identity(elder_code, float(c0), float(c1), frame_index)
+                push_recent_identity(elder_code, float(c0), float(c1), frame_index, camera_key)
 
     # 3️⃣ UI统计信息
     cv2.putText(frame, f"Persons: {person_count}", (20, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-    cv2.putText(frame, f"Falls: {fall_count}", (20, 60),
+    cv2.putText(frame, f"Falls: {camera_fall_counts.get(camera_key, 0)}", (20, 60),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
     mode_text = "(Auto)" if AUTO_DETECT_CAMERA_ANGLE else "(Manual)"
@@ -1736,10 +1904,18 @@ while True:
         cv2.putText(frame, alert_text, (50, 180),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
 
-    cv2.imshow("Smart AI Fall Detection (Final Demo)", frame)
+    cv2.imshow(f"Smart AI Fall Detection - {camera_key}", frame)
 
     if cv2.waitKey(1) & 0xFF == 27:
         break
 
-cap.release()
+camera_stop_event.set()
+for thread in camera_threads:
+    thread.join(timeout=0.2)
+
+for entry in camera_entries:
+    try:
+        entry["capture"].release()
+    except Exception:
+        pass
 cv2.destroyAllWindows()
