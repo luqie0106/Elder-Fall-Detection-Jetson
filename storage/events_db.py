@@ -184,6 +184,14 @@ def insert_fall_event(db_path: str, event: dict[str, Any]) -> int:
         return int(cursor.lastrowid)
 
 
+def clear_fall_events(db_path: str) -> int:
+    init_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.execute("DELETE FROM fall_events")
+        conn.commit()
+        return int(cursor.rowcount)
+
+
 def list_recent_events(db_path: str, limit: int = 100) -> list[dict[str, Any]]:
     init_db(db_path)
     with sqlite3.connect(db_path) as conn:
@@ -201,7 +209,7 @@ def list_recent_events(db_path: str, limit: int = 100) -> list[dict[str, Any]]:
 
         rows = conn.execute(
             """
-            SELECT id, event_time, camera_id, frame_idx, cx, cy, bbox_json, elder_code, channel_status, created_at
+            SELECT id, event_time, camera_id, frame_idx, cx, cy, bbox_json, elder_code, channel_status, extra_json, created_at
             FROM fall_events
             ORDER BY id DESC
             LIMIT ?
@@ -216,6 +224,11 @@ def list_recent_events(db_path: str, limit: int = 100) -> list[dict[str, Any]]:
             item["bbox"] = json.loads(item.pop("bbox_json") or "[]")
         except json.JSONDecodeError:
             item["bbox"] = []
+        try:
+            extra = json.loads(item.pop("extra_json") or "{}")
+        except json.JSONDecodeError:
+            extra = {}
+        item["snapshot_path"] = str(extra.get("snapshot_path") or "")
         code = str(item.get("elder_code") or "").strip()
         if code:
             elder_info = elder_map.get(code, {})

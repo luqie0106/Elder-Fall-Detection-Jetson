@@ -138,6 +138,8 @@ CLOSEUP_CLEAR_FALL_FRAMES = 2
 FACE_RECOG_INTERVAL = 15
 # 人脸绑定最多尝试次数（每个track）
 FACE_BIND_MAX_TRIES = 6
+# 人脸关键点最小数量（鼻子/眼睛/耳朵）
+FACE_MIN_KEYPOINTS_FOR_RECOG = 3
 # 头像更新：最小质量分与提升阈值
 AVATAR_MIN_SCORE = 0.18
 AVATAR_UPDATE_SCORE_MARGIN = 0.06
@@ -230,6 +232,9 @@ RECOVERY_CONFIRM_FRAMES = 6
 # 人体候选与轨迹保活
 CORE_BODY_FALLBACK_LOWER_POINTS = 3
 TRACK_STATE_TTL_FRAMES = 15
+RECENT_IDENTITY_MAX_AGE_FRAMES = 90
+RECENT_IDENTITY_MAX_DIST_RATIO = 0.12
+RECENT_IDENTITY_POOL_MAX = 80
 
 # 半蹲误报抑制（knee angle 越小表示屈膝越明显）
 HALF_SQUAT_KNEE_ANGLE_TH = 136.0
@@ -258,6 +263,7 @@ SUPPORT_OBJECT_LABELS = {"bed", "chair", "table", "dining table"}
 # 每个 track_id 对应一套独立状态
 person_states = {}
 recent_fall_events = []
+recent_identity_pool = []
 frame_index = 0
 fps_ema = 0.0
 FPS_EMA_ALPHA = 0.2
@@ -989,7 +995,25 @@ def is_duplicate_person_bbox(box_a, box_b, frame_w, frame_h):
 
     return False
 
-def try_register_fall_event(bbox, cx, cy, frame_w, frame_h, frame_idx, elder_code=""):
+def save_fall_snapshot(frame, frame_idx: int, elder_code: str = "") -> str:
+    if frame is None:
+        return ""
+
+    try:
+        FACES_DIR.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        code_part = str(elder_code or "unknown").strip() or "unknown"
+        file_name = f"fall_{ts}_{int(frame_idx):06d}_{code_part}.jpg"
+        file_path = FACES_DIR / file_name
+        ok = cv2.imwrite(str(file_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+        if not ok:
+            return ""
+        return f"/static/faces/{file_name}"
+    except Exception:
+        return ""
+
+
+def try_register_fall_event(bbox, cx, cy, frame_w, frame_h, frame_idx, elder_code="", frame=None):
     # 基于时间 + 空间去重：同一人同一次倒地只记一次
     global fall_count
 
@@ -1012,6 +1036,7 @@ def try_register_fall_event(bbox, cx, cy, frame_w, frame_h, frame_idx, elder_cod
         "bbox": bbox,
     })
     fall_count += 1
+    snapshot_path = save_fall_snapshot(frame, frame_idx, str(elder_code or ""))
 
     if report_fall_event is not None:
         try:
@@ -1023,6 +1048,7 @@ def try_register_fall_event(bbox, cx, cy, frame_w, frame_h, frame_idx, elder_cod
                 "cy": float(cy),
                 "bbox": [float(v) for v in bbox],
                 "elder_code": str(elder_code or ""),
+                "snapshot_path": snapshot_path,
             })
         except Exception as error:
             print(f"[WARN] 外部告警/入库失败: {error}")
@@ -1038,6 +1064,94 @@ def allocate_elder_code() -> str:
         return str(elder.get("elder_code") or "")
     except Exception:
         return ""
+
+
+def prune_recent_identity_pool(current_frame: int) -> None:
+    recent_identity_pool[:] = [
+        item for item in recent_identity_pool
+        if current_frame - int(item.get("frame", current_frame)) <= RECENT_IDENTITY_MAX_AGE_FRAMES
+    ]
+
+
+def push_recent_identity(elder_code: str, cx: float, cy: float, current_frame: int) -> None:
+    code = str(elder_code or "").strip()
+    if not code:
+        return
+
+    prune_recent_identity_pool(current_frame)
+    recent_identity_pool.append({
+        "elder_code": code,
+        "cx": float(cx),
+        "cy": float(cy),
+        "frame": int(current_frame),
+    })
+    if len(recent_identity_pool) > RECENT_IDENTITY_POOL_MAX:
+        recent_identity_pool[:] = recent_identity_pool[-RECENT_IDENTITY_POOL_MAX:]
+
+
+def try_reuse_recent_identity(cx: float, cy: float, frame_w: int, frame_h: int, current_frame: int) -> str:
+    prune_recent_identity_pool(current_frame)
+    if not recent_identity_pool:
+        return ""
+
+    max_dist = RECENT_IDENTITY_MAX_DIST_RATIO * max(float(frame_w), float(frame_h))
+    best_idx = -1
+    best_dist = 1e12
+
+    for idx, item in enumerate(recent_identity_pool):
+        dx = float(cx) - float(item.get("cx", 0.0))
+        dy = float(cy) - float(item.get("cy", 0.0))
+        dist = math.hypot(dx, dy)
+        if dist <= max_dist and dist < best_dist:
+            best_dist = dist
+            best_idx = idx
+
+    if best_idx < 0:
+        return ""
+
+    code = str(recent_identity_pool[best_idx].get("elder_code") or "").strip()
+    recent_identity_pool.pop(best_idx)
+    return code
+
+
+def extract_face_roi(frame, keypoints, bbox):
+    face_points = keypoints[0:5]
+    valid_face = face_points[(face_points[:, 0] > 0) & (face_points[:, 1] > 0)]
+    valid_count = int(len(valid_face))
+    if valid_count < FACE_MIN_KEYPOINTS_FOR_RECOG:
+        return None, valid_count
+
+    fx_min, fy_min = valid_face.min(axis=0)
+    fx_max, fy_max = valid_face.max(axis=0)
+    face_w = max(24.0, fx_max - fx_min)
+    face_h = max(24.0, fy_max - fy_min)
+
+    cx = (fx_min + fx_max) / 2.0
+    cy = (fy_min + fy_max) / 2.0
+    x1 = int(cx - 1.15 * face_w)
+    x2 = int(cx + 1.15 * face_w)
+    y1 = int(cy - 1.25 * face_h)
+    y2 = int(cy + 1.55 * face_h)
+
+    h, w = frame.shape[:2]
+    x1 = max(0, min(w - 1, x1))
+    x2 = max(0, min(w, x2))
+    y1 = max(0, min(h - 1, y1))
+    y2 = max(0, min(h, y2))
+
+    if x2 - x1 < 36 or y2 - y1 < 36:
+        return None, valid_count
+
+    x_min, y_min, x_max, y_max = bbox
+    body_h = max(1.0, y_max - y_min)
+    roi_bottom_ratio = (float(y2) - float(y_min)) / body_h
+    if roi_bottom_ratio > 0.62:
+        return None, valid_count
+
+    face_roi = frame[y1:y2, x1:x2]
+    if face_roi.size == 0:
+        return None, valid_count
+    return face_roi, valid_count
 
 
 def _compute_avatar_score(face_crop, valid_face_points: int) -> float:
@@ -1057,44 +1171,11 @@ def save_elder_avatar(frame, keypoints, bbox, elder_code: str, state: dict) -> N
     if not elder_code or update_elder_avatar is None:
         return
 
-    face_points = keypoints[0:5]
-    valid_face = face_points[(face_points[:, 0] > 0) & (face_points[:, 1] > 0)]
-
-    if len(valid_face) >= 2:
-        fx_min, fy_min = valid_face.min(axis=0)
-        fx_max, fy_max = valid_face.max(axis=0)
-        face_w = max(24.0, fx_max - fx_min)
-        face_h = max(24.0, fy_max - fy_min)
-
-        cx = (fx_min + fx_max) / 2.0
-        cy = (fy_min + fy_max) / 2.0
-        x1 = int(cx - 1.2 * face_w)
-        x2 = int(cx + 1.2 * face_w)
-        y1 = int(cy - 1.3 * face_h)
-        y2 = int(cy + 1.7 * face_h)
-    else:
-        x_min, y_min, x_max, y_max = bbox
-        body_w = max(24.0, x_max - x_min)
-        body_h = max(24.0, y_max - y_min)
-        x1 = int(x_min + 0.18 * body_w)
-        x2 = int(x_max - 0.18 * body_w)
-        y1 = int(y_min)
-        y2 = int(y_min + 0.48 * body_h)
-
-    h, w = frame.shape[:2]
-    x1 = max(0, min(w - 1, x1))
-    x2 = max(0, min(w, x2))
-    y1 = max(0, min(h - 1, y1))
-    y2 = max(0, min(h, y2))
-
-    if x2 - x1 < 20 or y2 - y1 < 20:
+    face_crop, valid_count = extract_face_roi(frame, keypoints, bbox)
+    if face_crop is None:
         return
 
-    face_crop = frame[y1:y2, x1:x2]
-    if face_crop.size == 0:
-        return
-
-    score = _compute_avatar_score(face_crop, int(len(valid_face)))
+    score = _compute_avatar_score(face_crop, valid_count)
     if score < AVATAR_MIN_SCORE:
         return
 
@@ -1123,6 +1204,7 @@ while True:
     recent_fall_events[:] = [
         e for e in recent_fall_events if frame_index - e["frame"] <= EVENT_DEDUP_FRAMES
     ]
+    prune_recent_identity_pool(frame_index)
 
     ret, frame = cap.read()
     if not ret:
@@ -1271,11 +1353,15 @@ while True:
             valid_xy = person["valid_xy"]
             x_min, y_min, x_max, y_max = person["bbox"]
             track_id = person["track_id"]
+            cx = int(np.mean(valid_xy[:, 0]))
+            cy = int(np.mean(valid_xy[:, 1]))
 
             active_track_ids.add(track_id)
 
             if track_id not in person_states:
-                initial_elder_code = allocate_elder_code()
+                initial_elder_code = try_reuse_recent_identity(cx, cy, frame_w, frame_h, frame_index)
+                if not initial_elder_code:
+                    initial_elder_code = allocate_elder_code()
                 person_states[track_id] = {
                     "history": [],
                     "fall_state": "NORMAL",
@@ -1298,6 +1384,8 @@ while True:
                     "recovery_frames": 0,
                     "last_fall_frame": -1000000,
                     "last_seen_frame": frame_index,
+                    "last_center": (float(cx), float(cy)),
+                    "last_bbox": [float(x_min), float(y_min), float(x_max), float(y_max)],
                 }
 
             state = person_states[track_id]
@@ -1305,15 +1393,13 @@ while True:
                 state["cooldown_timer"] -= 1
             state["seen_frames"] += 1
             state["last_seen_frame"] = frame_index
+            state["last_center"] = (float(cx), float(cy))
+            state["last_bbox"] = [float(x_min), float(y_min), float(x_max), float(y_max)]
 
             if face_service is not None and getattr(face_service, "available", False) and frame_index % FACE_RECOG_INTERVAL == 0:
                 try:
-                    x1 = max(0, int(x_min))
-                    y1 = max(0, int(y_min))
-                    x2 = min(frame.shape[1], int(x_max))
-                    y2 = min(frame.shape[0], int(y_max))
-                    if x2 - x1 > 20 and y2 - y1 > 20:
-                        face_roi = frame[y1:y2, x1:x2]
+                    face_roi, _ = extract_face_roi(frame, keypoints, person["bbox"])
+                    if face_roi is not None:
                         matched_code = None
                         if hasattr(face_service, "identify_only"):
                             matched_code = face_service.identify_only(face_roi)
@@ -1336,8 +1422,6 @@ while True:
                 except Exception:
                     pass
 
-            save_elder_avatar(frame, keypoints, person["bbox"], str(state.get("elder_code") or ""), state)
-
             # 1️⃣ 基础信息
             posture = get_posture(keypoints, dyn_horizontal_th)
             ref_y = get_reference_y(keypoints)
@@ -1347,9 +1431,6 @@ while True:
                     hips_y.append(keypoints[hip_idx][1])
             hip_y = float(np.mean(hips_y)) if hips_y else ref_y
             body_h = float(max(1.0, y_max - y_min))
-
-            cx = int(np.mean(valid_xy[:, 0]))
-            cy = int(np.mean(valid_xy[:, 1]))
 
             state["history"].append((posture, ref_y, hip_y, body_h))
             if len(state["history"]) > MAX_HISTORY:
@@ -1525,7 +1606,7 @@ while True:
                     state["last_fall_frame"] = frame_index
                     state["recovery_frames"] = 0
                     if state["cooldown_timer"] <= 0:
-                        try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index, state.get("elder_code", ""))
+                        try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index, state.get("elder_code", ""), frame)
                         state["cooldown_timer"] = FALL_RECOUNT_COOLDOWN_FRAMES
 
                 # ✅ 改4：持续躺地判断（防漏检）
@@ -1537,7 +1618,7 @@ while True:
                         state["last_fall_frame"] = frame_index
                         state["recovery_frames"] = 0
                         if state["cooldown_timer"] <= 0:
-                            try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index, state.get("elder_code", ""))
+                            try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index, state.get("elder_code", ""), frame)
                             state["cooldown_timer"] = FALL_RECOUNT_COOLDOWN_FRAMES
                 else:
                     state["ground_timer"] = 0
@@ -1556,7 +1637,7 @@ while True:
                         state["last_fall_frame"] = frame_index
                         state["recovery_frames"] = 0
                         if state["cooldown_timer"] <= 0:
-                            try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index, state.get("elder_code", ""))
+                            try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index, state.get("elder_code", ""), frame)
                             state["cooldown_timer"] = FALL_RECOUNT_COOLDOWN_FRAMES
                 else:
                     state["low_center_timer"] = 0
@@ -1572,7 +1653,7 @@ while True:
                         state["last_fall_frame"] = frame_index
                         state["recovery_frames"] = 0
                         if state["cooldown_timer"] <= 0:
-                            try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index, state.get("elder_code", ""))
+                            try_register_fall_event(person["bbox"], cx, cy, frame_w, frame_h, frame_index, state.get("elder_code", ""), frame)
                             state["cooldown_timer"] = FALL_RECOUNT_COOLDOWN_FRAMES
                 else:
                     state["ground_timer"] = 0
@@ -1618,7 +1699,15 @@ while True:
         if tid not in active_track_ids and frame_index - s.get("last_seen_frame", frame_index) > TRACK_STATE_TTL_FRAMES
     ]
     for tid in stale_ids:
-        person_states.pop(tid, None)
+        stale_state = person_states.pop(tid, None)
+        if stale_state is None:
+            continue
+        elder_code = str(stale_state.get("elder_code") or "")
+        center = stale_state.get("last_center", (None, None))
+        if elder_code and isinstance(center, tuple) and len(center) == 2:
+            c0, c1 = center
+            if c0 is not None and c1 is not None:
+                push_recent_identity(elder_code, float(c0), float(c1), frame_index)
 
     # 3️⃣ UI统计信息
     cv2.putText(frame, f"Persons: {person_count}", (20, 30),

@@ -41,11 +41,11 @@ class FaceRecognitionService:
             return None
 
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        locations = face_recognition.face_locations(frame_rgb, model="hog")
-        if not locations:
+        location = self._extract_valid_face_location(frame_rgb)
+        if location is None:
             return None
 
-        encodings = face_recognition.face_encodings(frame_rgb, known_face_locations=locations)
+        encodings = face_recognition.face_encodings(frame_rgb, known_face_locations=[location])
         if not encodings:
             return None
 
@@ -68,11 +68,11 @@ class FaceRecognitionService:
             return None
 
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        locations = face_recognition.face_locations(frame_rgb, model="hog")
-        if not locations:
+        location = self._extract_valid_face_location(frame_rgb)
+        if location is None:
             return None
 
-        encodings = face_recognition.face_encodings(frame_rgb, known_face_locations=locations)
+        encodings = face_recognition.face_encodings(frame_rgb, known_face_locations=[location])
         if not encodings:
             return None
 
@@ -90,11 +90,11 @@ class FaceRecognitionService:
             return False
 
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        locations = face_recognition.face_locations(frame_rgb, model="hog")
-        if not locations:
+        location = self._extract_valid_face_location(frame_rgb)
+        if location is None:
             return False
 
-        encodings = face_recognition.face_encodings(frame_rgb, known_face_locations=locations)
+        encodings = face_recognition.face_encodings(frame_rgb, known_face_locations=[location])
         if not encodings:
             return False
 
@@ -117,6 +117,46 @@ class FaceRecognitionService:
         if float(distances[best_idx]) <= self.tolerance:
             return str(known_codes[best_idx])
         return None
+
+    def _extract_valid_face_location(self, frame_rgb: np.ndarray):
+        face_recognition = _face_recognition
+        if face_recognition is None:
+            return None
+
+        locations = face_recognition.face_locations(frame_rgb, number_of_times_to_upsample=0, model="hog")
+        if not locations:
+            return None
+
+        height, width = frame_rgb.shape[:2]
+        min_edge = max(32, int(min(width, height) * 0.06))
+
+        valid_locations = []
+        for location in locations:
+            top, right, bottom, left = location
+            face_w = max(0, right - left)
+            face_h = max(0, bottom - top)
+            if face_w < min_edge or face_h < min_edge:
+                continue
+            ratio = face_w / max(1.0, float(face_h))
+            if ratio < 0.55 or ratio > 1.85:
+                continue
+            valid_locations.append(location)
+
+        if not valid_locations:
+            return None
+
+        best_location = max(valid_locations, key=lambda loc: (loc[2] - loc[0]) * (loc[1] - loc[3]))
+        landmarks = face_recognition.face_landmarks(frame_rgb, [best_location])
+        if not landmarks:
+            return None
+
+        landmark = landmarks[0]
+        has_eyes = bool(landmark.get("left_eye")) and bool(landmark.get("right_eye"))
+        has_nose = bool(landmark.get("nose_bridge")) or bool(landmark.get("nose_tip"))
+        if not (has_eyes and has_nose):
+            return None
+
+        return best_location
 
     def _load_known_faces(self) -> list[dict[str, Any]]:
         with sqlite3.connect(self.db_path) as conn:
