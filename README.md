@@ -255,6 +255,24 @@ pkill -f "web/app.py"
 - 支持一键清空所有告警记录（同时清理运行期截图/视频文件）；
 - 端口可通过 `FALL_WEB_PORT` 配置。
 
+### 6) `data/fall_events.db` 云端保持空基线
+
+如果你希望仓库（云端）里保留一个“空数据库基线”，但本地运行产生的数据不参与提交，可使用：
+
+```bash
+cd /path/to/aix_contest
+git update-index --skip-worktree data/fall_events.db
+```
+
+说明：
+
+- 该命令是**本地 Git 配置**，只对当前机器生效；
+- 取消该设置时可执行：
+
+```bash
+git update-index --no-skip-worktree data/fall_events.db
+```
+
 ## 📄 第三方许可证说明
 
 本项目包含对第三方库（如 `face_recognition`）的依赖调用。
