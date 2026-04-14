@@ -104,6 +104,12 @@ UNRECOVERED_ALERT_FRAMES = 120
 EVENT_CLIP_PRE_SECONDS = max(3, min(5, int(os.getenv("FALL_CLIP_PRE_SECONDS", "3"))))
 EVENT_CLIP_POST_SECONDS = max(3, min(5, int(os.getenv("FALL_CLIP_POST_SECONDS", "3"))))
 EVENT_CLIP_FPS = 15
+EVENT_CLIP_EXT = str(os.getenv("FALL_CLIP_EXT", "mp4")).strip().lower().lstrip(".") or "mp4"
+EVENT_CLIP_CODECS = [
+    c.strip()
+    for c in os.getenv("FALL_CLIP_CODECS", "H264,avc1,mp4v").split(",")
+    if len(c.strip()) == 4
+]
 TRACK_PERSIST = len(camera_entries) <= 1
 
 # =====================
@@ -1084,12 +1090,29 @@ def _write_clip_file(frames: list, file_path: Path, fps: int) -> bool:
     if not frames:
         return False
     h, w = frames[0].shape[:2]
-    writer = cv2.VideoWriter(str(file_path), cv2.VideoWriter_fourcc(*"mp4v"), float(max(1, fps)), (int(w), int(h)))
-    if not writer.isOpened():
+    writer = None
+    used_codec = ""
+    for codec in EVENT_CLIP_CODECS or ["H264", "avc1", "mp4v"]:
+        trial = cv2.VideoWriter(
+            str(file_path),
+            cv2.VideoWriter_fourcc(*codec),
+            float(max(1, fps)),
+            (int(w), int(h)),
+        )
+        if trial.isOpened():
+            writer = trial
+            used_codec = codec
+            break
+        trial.release()
+
+    if writer is None:
         return False
+
     for frame in frames:
         writer.write(frame)
     writer.release()
+    if used_codec:
+        print(f"[clip] saved {file_path.name} codec={used_codec}")
     return True
 
 
@@ -1114,7 +1137,7 @@ def enqueue_event_clip(camera_key: str, frame_idx: int, elder_code: str = "") ->
     FACES_DIR.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
     code_part = str(elder_code or "unknown").strip() or "unknown"
-    file_name = f"fall_{camera_key}_{ts}_{int(frame_idx):06d}_{code_part}.mp4"
+    file_name = f"fall_{camera_key}_{ts}_{int(frame_idx):06d}_{code_part}.{EVENT_CLIP_EXT}"
     file_path = FACES_DIR / file_name
     url_path = f"/static/faces/{file_name}"
 
