@@ -200,18 +200,18 @@ FALL_CAMERA_SOURCES=0,rtsp://user:pass@192.168.1.10:554/stream1 python3 main.py
 python3 web/app.py
 ```
 
-浏览器访问：`http://127.0.0.1:5000`
+浏览器访问：`http://127.0.0.1:5001`
 
 若提示端口被占用（`Address already in use`），可改端口启动：
 
 ```bash
-FALL_WEB_PORT=5001 python3 web/app.py
+FALL_WEB_PORT=5002 python3 web/app.py
 ```
 
 若你使用项目虚拟环境，也可显式指定解释器：
 
 ```bash
-FALL_WEB_PORT=5001 .venv/bin/python web/app.py
+FALL_WEB_PORT=5002 .venv/bin/python web/app.py
 ```
 
 ### 3.1 推荐启动命令（C）
@@ -223,11 +223,11 @@ cd /path/to/aix_contest
 .venv/bin/python web/app.py
 ```
 
-若 `5000` 被占用：
+若 `5001` 被占用：
 
 ```bash
 cd /path/to/aix_contest
-FALL_WEB_PORT=5001 .venv/bin/python web/app.py
+FALL_WEB_PORT=5002 .venv/bin/python web/app.py
 ```
 
 若仍失败，先检查端口占用再重启：
