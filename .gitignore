@@ -213,6 +213,7 @@ __marimo__/
 __pycache__/
 *.pt
 *.engine
+*.onnx
 
 # accidental pip/version artifact files
 =3.0.0
