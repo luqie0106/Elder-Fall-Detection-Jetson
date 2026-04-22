@@ -79,9 +79,66 @@ def init_db(db_path: str) -> None:
             """
         )
 
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS person_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_time TEXT NOT NULL,
+                date_key TEXT NOT NULL,
+                camera_id TEXT,
+                track_token TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
         _ensure_column(conn, "fall_events", "elder_code", "TEXT")
         _ensure_column(conn, "elders", "avatar_path", "TEXT")
         conn.commit()
+
+
+def insert_person_entry(db_path: str, entry: dict[str, Any]) -> int:
+    init_db(db_path)
+    now = datetime.now().isoformat(timespec="seconds")
+    entry_time = str(entry.get("entry_time") or now)
+    date_key = str(entry_time[:10])
+
+    with sqlite3.connect(db_path) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO person_entries (
+                entry_time, date_key, camera_id, track_token, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                entry_time,
+                date_key,
+                str(entry.get("camera_id") or "cam-0"),
+                str(entry.get("track_token") or ""),
+                now,
+            ),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+
+
+def get_today_overview(db_path: str) -> dict[str, int]:
+    init_db(db_path)
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    with sqlite3.connect(db_path) as conn:
+        entered_row = conn.execute(
+            "SELECT COUNT(*) FROM person_entries WHERE date_key = ?",
+            (today,),
+        ).fetchone()
+        alarms_row = conn.execute(
+            "SELECT COUNT(*) FROM fall_events WHERE substr(event_time, 1, 10) = ?",
+            (today,),
+        ).fetchone()
+
+    entered_today = int(entered_row[0]) if entered_row and entered_row[0] is not None else 0
+    alarms_today = int(alarms_row[0]) if alarms_row and alarms_row[0] is not None else 0
+    return {"entered_today": entered_today, "alarms_today": alarms_today}
 
 
 def ensure_elder(db_path: str, elder_code: str | None = None) -> dict[str, Any]:

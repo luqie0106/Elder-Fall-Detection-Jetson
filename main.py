@@ -21,10 +21,11 @@ except Exception:
     get_default_face_service = None
 
 try:
-    from storage.events_db import ensure_elder, update_elder_avatar
+    from storage.events_db import ensure_elder, update_elder_avatar, insert_person_entry
 except Exception:
     ensure_elder = None
     update_elder_avatar = None
+    insert_person_entry = None
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = str(PROJECT_ROOT / "data" / "fall_events.db")
@@ -100,6 +101,8 @@ fall_count = 0
 person_count = 0
 FALL_HOLD_TIME = 30  # 保持红框30帧（约1秒）
 UNRECOVERED_ALERT_FRAMES = 120
+ENTRY_STABLE_FRAMES = 8
+DWELL_ALERT_SECONDS = 30.0
 
 EVENT_CLIP_PRE_SECONDS = max(3, min(5, int(os.getenv("FALL_CLIP_PRE_SECONDS", "3"))))
 EVENT_CLIP_POST_SECONDS = max(3, min(5, int(os.getenv("FALL_CLIP_POST_SECONDS", "3"))))
@@ -111,6 +114,7 @@ EVENT_CLIP_CODECS = [
     if len(c.strip()) == 4
 ]
 TRACK_PERSIST = len(camera_entries) <= 1
+TRACKER_CFG = str(os.getenv("FALL_TRACKER", "bytetrack.yaml")).strip() or "bytetrack.yaml"
 
 # =====================
 # 可调阈值（调参指南）
@@ -1389,7 +1393,7 @@ while True:
 
     # 使用 ByteTrack 进行目标跟踪，保证每个人独立 history
     infer_start_t = time.perf_counter()
-    results = model.track(frame, persist=TRACK_PERSIST, tracker="bytetrack.yaml", verbose=False)[0]
+    results = model.track(frame, persist=TRACK_PERSIST, tracker=TRACKER_CFG, verbose=False)[0]
     infer_end_t = time.perf_counter()
 
     if hasattr(results, "speed") and isinstance(results.speed, dict):
@@ -1564,6 +1568,9 @@ while True:
                     "last_bbox": [float(x_min), float(y_min), float(x_max), float(y_max)],
                     "suspected_sent": False,
                     "unrecovered_sent": False,
+                    "first_seen_ts": time.time(),
+                    "entry_logged": False,
+                    "dwell_30s_noted": False,
                 }
 
             state = person_states[track_id]
@@ -1573,6 +1580,24 @@ while True:
             state["last_seen_frame"] = frame_index
             state["last_center"] = (float(cx), float(cy))
             state["last_bbox"] = [float(x_min), float(y_min), float(x_max), float(y_max)]
+
+            if (not state.get("entry_logged")) and state["seen_frames"] >= ENTRY_STABLE_FRAMES and insert_person_entry is not None:
+                try:
+                    insert_person_entry(
+                        DEFAULT_DB_PATH,
+                        {
+                            "entry_time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                            "camera_id": camera_key,
+                            "track_token": f"{camera_key}:{track_id[1] if isinstance(track_id, tuple) else track_id}",
+                        },
+                    )
+                    state["entry_logged"] = True
+                except Exception:
+                    pass
+
+            dwell_seconds = max(0.0, time.time() - float(state.get("first_seen_ts", time.time())))
+            if dwell_seconds >= DWELL_ALERT_SECONDS:
+                state["dwell_30s_noted"] = True
 
             if face_service is not None and getattr(face_service, "available", False) and frame_index % FACE_RECOG_INTERVAL == 0:
                 try:
@@ -1885,6 +1910,17 @@ while True:
                         (int(x_min), int(y_min)),
                         (int(x_max), int(y_max)),
                         color, 2)
+
+            if state.get("dwell_30s_noted"):
+                cv2.putText(
+                    frame,
+                    f"Track {track_id[1] if isinstance(track_id, tuple) else track_id}: stay {int(dwell_seconds)}s",
+                    (int(x_min), max(20, int(y_min) - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 165, 255),
+                    2,
+                )
 
     # 清理已消失目标，防止状态无限增长
     stale_ids = [

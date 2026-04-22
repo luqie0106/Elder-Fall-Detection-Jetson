@@ -11,6 +11,10 @@
     table { width: 100%; border-collapse: collapse; }
     th, td { text-align: left; padding: 8px; border-bottom: 1px solid #eceff3; font-size: 14px; }
     th { background: #fafbfc; }
+    .stats { display: grid; grid-template-columns: repeat(2, minmax(180px, 1fr)); gap: 12px; margin-bottom: 14px; }
+    .stat-card { background: #f8fafc; border: 1px solid #e8edf3; border-radius: 10px; padding: 10px 12px; }
+    .stat-label { color: #5b6678; font-size: 13px; }
+    .stat-value { font-size: 24px; font-weight: 700; margin-top: 2px; }
     .elder-cell { display: flex; align-items: center; gap: 10px; }
     .avatar { width: 40px; height: 40px; border-radius: 6px; object-fit: cover; border: 1px solid #dde3ea; background: #f3f5f8; }
     .snapshot { width: 96px; height: 54px; border-radius: 6px; object-fit: cover; border: 1px solid #dde3ea; background: #f3f5f8; }
@@ -21,6 +25,16 @@
 <body>
   <div class="card">
     <h1>最近告警记录</h1>
+    <div class="stats">
+      <div class="stat-card">
+        <div class="stat-label">今日进入人数</div>
+        <div class="stat-value">{{ overview.entered_today if overview else 0 }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">今日报警次数</div>
+        <div class="stat-value">{{ overview.alarms_today if overview else 0 }}</div>
+      </div>
+    </div>
     <div class="toolbar">
       <form method="post" action="/events/clear" onsubmit="return confirm('确认清空所有告警记录吗？该操作不可恢复。');">
         <button class="danger-btn" type="submit">一键清空所有告警记录</button>

@@ -8,7 +8,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from storage.events_db import clear_fall_events, list_recent_events
+from storage.events_db import clear_fall_events, get_today_overview, list_recent_events
 
 DB_PATH = str(PROJECT_ROOT / "data" / "fall_events.db")
 
@@ -33,14 +33,16 @@ def _clear_snapshot_files() -> None:
 def index():
     limit = int(request.args.get("limit", 50))
     events = list_recent_events(DB_PATH, limit=limit)
-    return render_template("index.html", events=events, limit=limit)
+    overview = get_today_overview(DB_PATH)
+    return render_template("index.html", events=events, limit=limit, overview=overview)
 
 
 @app.route("/api/events")
 def api_events():
     limit = int(request.args.get("limit", 50))
     events = list_recent_events(DB_PATH, limit=limit)
-    return jsonify({"items": events, "count": len(events)})
+    overview = get_today_overview(DB_PATH)
+    return jsonify({"items": events, "count": len(events), "overview": overview})
 
 
 @app.route("/events/clear", methods=["POST"])
