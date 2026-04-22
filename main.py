@@ -6,6 +6,7 @@ import numpy as np
 import math
 import time
 import os
+import subprocess
 import threading
 import importlib
 from pathlib import Path
@@ -60,6 +61,18 @@ def _resolve_fall_model_path() -> tuple[str, str]:
         if "/" not in env_model and "\\" not in env_model:
             return env_model, "env-download"
         print(f"[Model] FALL_MODEL_PATH={env_model} 在本地未找到，继续按默认策略选择。")
+
+    # 优先尊重 FALL_MODEL_DEFAULT：若本地存在同名文件，直接使用
+    default_local = _pick_local(default_model_name)
+    if default_local is not None:
+        return default_local, "default-local"
+
+    # 其次尝试同名 .engine（便于将 pt 导出后无缝切换）
+    default_stem = Path(default_model_name).stem
+    if default_stem:
+        preferred_engine = _pick_local(f"{default_stem}.engine")
+        if preferred_engine is not None:
+            return preferred_engine, "default-engine-local"
 
     for pattern in ("yolo*-pose.engine", "yolo*-pose.pt"):
         for local_model in sorted(PROJECT_ROOT.glob(pattern)):
@@ -154,6 +167,12 @@ EVENT_CLIP_CODECS = [
     for c in os.getenv("FALL_CLIP_CODECS", "H264,avc1,mp4v").split(",")
     if len(c.strip()) == 4
 ]
+EVENT_CLIP_AUTO_FIX_BROWSER = str(os.getenv("FALL_CLIP_AUTO_FIX_BROWSER", "1")).strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 TRACK_PERSIST = len(camera_entries) <= 1
 TRACKER_CFG = str(os.getenv("FALL_TRACKER", "bytetrack.yaml")).strip() or "bytetrack.yaml"
 TRACKER_BACKEND = str(os.getenv("FALL_TRACKER_BACKEND", "deepsort")).strip().lower()
@@ -413,6 +432,7 @@ camera_frame_buffers = {
 }
 camera_pending_clips = {entry["camera_key"]: [] for entry in camera_entries}
 camera_fall_counts = {entry["camera_key"]: 0 for entry in camera_entries}
+warned_no_keypoints = False
 
 def get_posture(keypoints, horizontal_ratio_th):
     valid_xy = keypoints[(keypoints[:, 0] > 0) & (keypoints[:, 1] > 0)]
@@ -1157,33 +1177,144 @@ def save_fall_snapshot(frame, frame_idx: int, elder_code: str = "") -> str:
         return ""
 
 
+def _probe_video_codec(file_path: Path) -> str:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(file_path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=8,
+        )
+        if result.returncode != 0:
+            return ""
+        return str(result.stdout or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def fix_video_for_browser(file_path: Path) -> bool:
+    codec = _probe_video_codec(file_path)
+    if "mpeg4" not in codec:
+        return True
+
+    tmp_path = file_path.with_name(f"{file_path.stem}_tmp{file_path.suffix}")
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-y",
+                "-i",
+                str(file_path),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "superfast",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                str(tmp_path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=90,
+        )
+        if result.returncode != 0:
+            print(f"[clip] ffmpeg transcode failed for {file_path.name}: {result.stderr.strip()}")
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+            return False
+
+        tmp_path.replace(file_path)
+        print(f"[clip] browser-fix applied {file_path.name}: mpeg4 -> h264")
+        return True
+    except Exception as error:
+        print(f"[clip] browser-fix exception for {file_path.name}: {error}")
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+        return False
+
+
 def _write_clip_file(frames: list, file_path: Path, fps: int) -> bool:
     if not frames:
         return False
     h, w = frames[0].shape[:2]
-    writer = None
+
+    # 清理旧文件，避免残留空文件影响本次判定
+    if file_path.exists():
+        try:
+            file_path.unlink()
+        except Exception:
+            pass
+
     used_codec = ""
+    write_ok = False
     for codec in EVENT_CLIP_CODECS or ["H264", "avc1", "mp4v"]:
-        trial = cv2.VideoWriter(
+        writer = cv2.VideoWriter(
             str(file_path),
             cv2.VideoWriter_fourcc(*codec),
             float(max(1, fps)),
             (int(w), int(h)),
         )
-        if trial.isOpened():
-            writer = trial
-            used_codec = codec
-            break
-        trial.release()
+        if not writer.isOpened():
+            writer.release()
+            continue
 
-    if writer is None:
+        wrote_frames = 0
+        for frame in frames:
+            if frame is None or getattr(frame, "size", 0) == 0:
+                continue
+            fh, fw = frame.shape[:2]
+            if fh != h or fw != w:
+                frame = cv2.resize(frame, (int(w), int(h)))
+            writer.write(frame)
+            wrote_frames += 1
+        writer.release()
+
+        file_size = 0
+        try:
+            if file_path.exists():
+                file_size = int(file_path.stat().st_size)
+        except Exception:
+            file_size = 0
+
+        # 部分后端会“打开成功但写出空文件”，这里做最低可用校验
+        if wrote_frames > 0 and file_size > 2048:
+            used_codec = codec
+            write_ok = True
+            break
+
+        try:
+            if file_path.exists():
+                file_path.unlink()
+        except Exception:
+            pass
+
+    if not write_ok:
+        print(
+            f"[clip] failed to save {file_path.name} with codecs={EVENT_CLIP_CODECS or ['H264', 'avc1', 'mp4v']}"
+        )
         return False
 
-    for frame in frames:
-        writer.write(frame)
-    writer.release()
     if used_codec:
         print(f"[clip] saved {file_path.name} codec={used_codec}")
+    if EVENT_CLIP_AUTO_FIX_BROWSER:
+        fix_video_for_browser(file_path)
     return True
 
 
@@ -1197,7 +1328,9 @@ def update_pending_event_clips(camera_key: str, frame) -> None:
         item["frames"].append(frame.copy())
         item["post_left"] -= 1
         if item["post_left"] <= 0:
-            _write_clip_file(item["frames"], item["file_path"], EVENT_CLIP_FPS)
+            saved = _write_clip_file(item["frames"], item["file_path"], EVENT_CLIP_FPS)
+            if not saved:
+                print(f"[clip] save failed: camera={camera_key} file={item['file_path'].name}")
             done_indexes.append(idx)
 
     for idx in reversed(done_indexes):
@@ -1496,6 +1629,14 @@ while True:
     person_count = 0
 
     active_track_ids = set()
+
+    if results.keypoints is None:
+        if (not warned_no_keypoints) and str(MODEL_PATH).lower().endswith(".engine"):
+            print(
+                "[WARN] 当前 .engine 推理结果没有 keypoints，跌倒事件不会触发。"
+                "请确认 engine 来自 pose 模型导出，或改用 *.pt pose 模型。"
+            )
+            warned_no_keypoints = True
 
     if results.keypoints is not None:
         num_people = len(results.keypoints.xy)
