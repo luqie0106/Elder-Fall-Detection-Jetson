@@ -57,11 +57,17 @@ model = YOLO("yolov8n-pose.pt")
 model.export(format="engine", device=0)
 ```
 
-生成 `yolov8n-pose.engine` 后，将脚本中的模型加载改为：
+若你需要在代码里直接加载 `engine`，示例如下：
 
 ```python
 model = YOLO("yolov8n-pose.engine")
 ```
+
+实际运行时无需手改代码，`main.py` 会按以下顺序自动选择模型：
+
+1. `FALL_MODEL_PATH` 指定的本地文件（若存在）；
+2. 当前目录下的 `yolo*-pose.engine` / `yolo*-pose.pt`；
+3. 若本地都没有，则使用默认模型名并自动下载（默认 `yolov8n-pose.pt`）。
 
 ## 🧠 核心算法逻辑
 
@@ -130,18 +136,91 @@ Jetson 设备请保持系统预装 `torch/torchvision`，不要通过 pip 覆盖
 ### 2) 运行跌倒检测（已接入告警与入库）
 
 ```bash
+cd /path/to/aix_contest
 python3 main.py
 ```
 
 支持通过环境变量配置多摄像头与事件视频片段：
 
 ```bash
+cd /path/to/aix_contest
 FALL_CAMERA_SOURCES=0,1 FALL_CLIP_PRE_SECONDS=5 FALL_CLIP_POST_SECONDS=5 python3 main.py
 ```
 
 - `FALL_CAMERA_SOURCES`：摄像头列表，逗号分隔，支持本地索引和 RTSP/HTTP 地址。
 - `FALL_CLIP_PRE_SECONDS`：跌倒前视频秒数，范围 `3~5`。
 - `FALL_CLIP_POST_SECONDS`：跌倒后视频秒数，范围 `3~5`。
+- `FALL_MODEL_PATH`：可选模型路径或模型名（例如 `/path/to/yolov8n-pose.engine` 或 `yolov8n-pose.pt`）。
+- `FALL_MODEL_DEFAULT`：默认回退模型名（本地无模型且未指定有效 `FALL_MODEL_PATH` 时使用，默认 `yolov8n-pose.pt`）。
+
+示例（显式指定模型）：
+
+```bash
+cd /path/to/aix_contest
+FALL_MODEL_PATH=/path/to/yolov8n-pose.engine python3 main.py
+```
+
+#### 2.0) 模型选择顺序与默认模型修改
+
+`main.py` 启动时模型选择顺序如下：
+
+1. `FALL_MODEL_PATH` 指向的本地文件（优先级最高）；
+2. 当前目录下自动搜索 `yolo*-pose.engine`，找不到再搜 `yolo*-pose.pt`；
+3. 若本地没有可用模型，则使用 `FALL_MODEL_DEFAULT`（默认 `yolov8n-pose.pt`）并自动下载。
+
+临时修改“默认回退模型”（仅当前命令生效）：
+
+```bash
+cd /path/to/aix_contest
+FALL_MODEL_DEFAULT=yolov8s-pose.pt python3 main.py
+```
+
+永久修改“默认回退模型”（改代码）：
+
+- 文件：`main.py`
+- 位置：`_resolve_fall_model_path()` 中的 `os.getenv("FALL_MODEL_DEFAULT", "yolov8n-pose.pt")`
+- 将第二个参数从 `yolov8n-pose.pt` 改为你希望的默认模型名。
+
+强制指定某个模型文件（会覆盖默认策略）：
+
+```bash
+cd /path/to/aix_contest
+FALL_MODEL_PATH=/path/to/your/model.engine python3 main.py
+```
+
+支持切换跟踪后端（默认 `deepsort`，若未安装依赖会自动回退到 `ultralytics` / ByteTrack）：
+
+```bash
+cd /path/to/aix_contest
+FALL_TRACKER_BACKEND=deepsort python3 main.py
+```
+
+默认运行无需额外参数（会优先尝试 DeepSORT）：
+
+```bash
+cd /path/to/aix_contest
+python3 main.py
+```
+
+推荐使用虚拟环境解释器运行 DeepSORT：
+
+```bash
+cd /path/to/aix_contest
+FALL_TRACKER_BACKEND=deepsort /path/to/aix_contest/.venv/bin/python main.py
+```
+
+可选 DeepSORT 参数：
+
+- `FALL_DEEPSORT_MAX_AGE`（默认 `30`）
+- `FALL_DEEPSORT_N_INIT`（默认 `3`）
+- `FALL_DEEPSORT_MAX_IOU_DISTANCE`（默认 `0.7`）
+
+若仍使用 Ultralytics 跟踪器（ByteTrack/BoT-SORT），可继续指定：
+
+```bash
+cd /path/to/aix_contest
+FALL_TRACKER_BACKEND=ultralytics FALL_TRACKER=bytetrack.yaml python3 main.py
+```
 
 ### 2.1 人脸识别（可选）
 
@@ -185,18 +264,21 @@ pip install -r requirements/face.txt
 当前已支持多路摄像头并行采集（每路独立抓帧线程，主循环统一推理与告警）：
 
 ```bash
+cd /path/to/aix_contest
 FALL_CAMERA_SOURCES=0,1 python3 main.py
 ```
 
 也支持混合本地与网络摄像头：
 
 ```bash
+cd /path/to/aix_contest
 FALL_CAMERA_SOURCES=0,rtsp://user:pass@192.168.1.10:554/stream1 python3 main.py
 ```
 
 ### 3) 启动网页查看告警记录
 
 ```bash
+cd /path/to/aix_contest
 python3 web/app.py
 ```
 
@@ -205,6 +287,7 @@ python3 web/app.py
 若提示端口被占用（`Address already in use`），可改端口启动：
 
 ```bash
+cd /path/to/aix_contest
 FALL_WEB_PORT=5002 python3 web/app.py
 ```
 

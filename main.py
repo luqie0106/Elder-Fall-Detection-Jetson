@@ -7,8 +7,16 @@ import math
 import time
 import os
 import threading
+import importlib
 from pathlib import Path
 from collections import deque
+from typing import Any
+
+try:
+    _deepsort_mod = importlib.import_module("deep_sort_realtime.deepsort_tracker")
+    DeepSort = getattr(_deepsort_mod, "DeepSort", None)
+except Exception:
+    DeepSort = None
 
 try:
     from services.event_pipeline import report_fall_event
@@ -31,8 +39,41 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = str(PROJECT_ROOT / "data" / "fall_events.db")
 FACES_DIR = PROJECT_ROOT / "web" / "static" / "faces"
 
+def _resolve_fall_model_path() -> tuple[str, str]:
+    env_model = str(os.getenv("FALL_MODEL_PATH", "")).strip()
+    default_model_name = str(os.getenv("FALL_MODEL_DEFAULT", "yolov8n-pose.pt")).strip() or "yolov8n-pose.pt"
+
+    def _pick_local(candidate: str) -> str | None:
+        model_path = Path(candidate).expanduser()
+        if model_path.is_file():
+            return str(model_path)
+        if not model_path.is_absolute():
+            project_model_path = (PROJECT_ROOT / model_path).resolve()
+            if project_model_path.is_file():
+                return str(project_model_path)
+        return None
+
+    if env_model:
+        local_model = _pick_local(env_model)
+        if local_model is not None:
+            return local_model, "env-local"
+        if "/" not in env_model and "\\" not in env_model:
+            return env_model, "env-download"
+        print(f"[Model] FALL_MODEL_PATH={env_model} 在本地未找到，继续按默认策略选择。")
+
+    for pattern in ("yolo*-pose.engine", "yolo*-pose.pt"):
+        for local_model in sorted(PROJECT_ROOT.glob(pattern)):
+            if local_model.is_file():
+                return str(local_model), "local"
+
+    return default_model_name, "default-download"
+
+
+MODEL_PATH, MODEL_SOURCE = _resolve_fall_model_path()
+print(f"[Model] 使用模型: {MODEL_PATH} (source={MODEL_SOURCE})")
+
 # 加载模型（一个模型同时支持检测+pose）
-model = YOLO("yolov8n-pose.pt")
+model = YOLO(MODEL_PATH)
 
 face_service = None
 if get_default_face_service is not None:
@@ -115,6 +156,32 @@ EVENT_CLIP_CODECS = [
 ]
 TRACK_PERSIST = len(camera_entries) <= 1
 TRACKER_CFG = str(os.getenv("FALL_TRACKER", "bytetrack.yaml")).strip() or "bytetrack.yaml"
+TRACKER_BACKEND = str(os.getenv("FALL_TRACKER_BACKEND", "deepsort")).strip().lower()
+DEEPSORT_MAX_AGE = int(os.getenv("FALL_DEEPSORT_MAX_AGE", "30"))
+DEEPSORT_N_INIT = int(os.getenv("FALL_DEEPSORT_N_INIT", "3"))
+DEEPSORT_MAX_IOU_DISTANCE = float(os.getenv("FALL_DEEPSORT_MAX_IOU_DISTANCE", "0.7"))
+
+if TRACKER_BACKEND == "deepsort" and DeepSort is None:
+    print("[WARN] DeepSORT 依赖未安装，自动回退到 ByteTrack(ultralytics tracker)。")
+    TRACKER_BACKEND = "ultralytics"
+
+camera_trackers: dict[str, Any] = {}
+if TRACKER_BACKEND == "deepsort" and DeepSort is not None:
+    for entry in camera_entries:
+        camera_key = str(entry["camera_key"])
+        camera_trackers[camera_key] = DeepSort(
+            max_age=DEEPSORT_MAX_AGE,
+            n_init=DEEPSORT_N_INIT,
+            max_iou_distance=DEEPSORT_MAX_IOU_DISTANCE,
+        )
+
+if TRACKER_BACKEND == "deepsort":
+    print(
+        f"[INFO] Tracker backend: deepsort (max_age={DEEPSORT_MAX_AGE}, "
+        f"n_init={DEEPSORT_N_INIT}, max_iou_distance={DEEPSORT_MAX_IOU_DISTANCE})"
+    )
+else:
+    print(f"[INFO] Tracker backend: ultralytics (tracker={TRACKER_CFG})")
 
 # =====================
 # 可调阈值（调参指南）
@@ -1391,9 +1458,12 @@ while True:
 
     estimated_pitch = CAMERA_PITCH_ANGLE
 
-    # 使用 ByteTrack 进行目标跟踪，保证每个人独立 history
+    # 跟踪后端：ultralytics(默认) 或 deepsort
     infer_start_t = time.perf_counter()
-    results = model.track(frame, persist=TRACK_PERSIST, tracker=TRACKER_CFG, verbose=False)[0]
+    if TRACKER_BACKEND == "deepsort":
+        results = model(frame, verbose=False)[0]
+    else:
+        results = model.track(frame, persist=TRACK_PERSIST, tracker=TRACKER_CFG, verbose=False)[0]
     infer_end_t = time.perf_counter()
 
     if hasattr(results, "speed") and isinstance(results.speed, dict):
@@ -1428,9 +1498,62 @@ while True:
     active_track_ids = set()
 
     if results.keypoints is not None:
-        track_ids = None
-        if results.boxes is not None and results.boxes.id is not None:
-            track_ids = results.boxes.id.int().cpu().tolist()
+        num_people = len(results.keypoints.xy)
+        track_ids = list(range(num_people))
+        keypoint_boxes: list[tuple[float, float, float, float]] = []
+        keypoint_confs: list[float] = []
+
+        for idx, k in enumerate(results.keypoints.xy):
+            keypoints = k.cpu().numpy()
+            valid_xy = keypoints[(keypoints[:, 0] > 0) & (keypoints[:, 1] > 0)]
+            if len(valid_xy) >= 2:
+                x_min, y_min = valid_xy.min(axis=0)
+                x_max, y_max = valid_xy.max(axis=0)
+                keypoint_boxes.append((float(x_min), float(y_min), float(x_max), float(y_max)))
+            else:
+                keypoint_boxes.append((0.0, 0.0, 0.0, 0.0))
+
+            if results.boxes is not None and idx < len(results.boxes):
+                keypoint_confs.append(float(results.boxes[idx].conf[0]))
+            else:
+                keypoint_confs.append(0.5)
+
+        if TRACKER_BACKEND == "ultralytics":
+            if results.boxes is not None and results.boxes.id is not None:
+                track_ids = results.boxes.id.int().cpu().tolist()
+        elif TRACKER_BACKEND == "deepsort" and camera_key in camera_trackers:
+            detections = []
+            det_indices = []
+            for idx, bbox in enumerate(keypoint_boxes):
+                x1, y1, x2, y2 = bbox
+                w = x2 - x1
+                h = y2 - y1
+                if w < 2.0 or h < 2.0:
+                    continue
+                detections.append(([float(x1), float(y1), float(w), float(h)], float(keypoint_confs[idx]), "person"))
+                det_indices.append(idx)
+
+            tracks = camera_trackers[camera_key].update_tracks(detections, frame=frame)
+            used_det = set()
+            for trk in tracks:
+                if not trk.is_confirmed():
+                    continue
+                l, t, r, b = trk.to_ltrb()
+                track_box = (float(l), float(t), float(r), float(b))
+
+                best_idx = -1
+                best_iou = 0.0
+                for det_idx in det_indices:
+                    if det_idx in used_det:
+                        continue
+                    iou = bbox_iou(track_box, keypoint_boxes[det_idx])
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_idx = det_idx
+
+                if best_idx >= 0 and best_iou >= 0.1:
+                    track_ids[best_idx] = int(trk.track_id)
+                    used_det.add(best_idx)
 
         frame_h, frame_w = frame.shape[:2]
         # 先收集候选人体，再做同帧去重，最后进入状态机
