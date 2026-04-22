@@ -7,6 +7,7 @@ import math
 import time
 import os
 import subprocess
+import queue
 import threading
 import importlib
 from pathlib import Path
@@ -167,6 +168,13 @@ EVENT_CLIP_CODECS = [
     for c in os.getenv("FALL_CLIP_CODECS", "H264,avc1,mp4v").split(",")
     if len(c.strip()) == 4
 ]
+EVENT_CLIP_ASYNC_WRITE = str(os.getenv("FALL_CLIP_ASYNC_WRITE", "1")).strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+EVENT_CLIP_QUEUE_SIZE = max(1, int(os.getenv("FALL_CLIP_QUEUE_SIZE", "8")))
 EVENT_CLIP_AUTO_FIX_BROWSER = str(os.getenv("FALL_CLIP_AUTO_FIX_BROWSER", "1")).strip().lower() not in {
     "0",
     "false",
@@ -176,9 +184,47 @@ EVENT_CLIP_AUTO_FIX_BROWSER = str(os.getenv("FALL_CLIP_AUTO_FIX_BROWSER", "1")).
 TRACK_PERSIST = len(camera_entries) <= 1
 TRACKER_CFG = str(os.getenv("FALL_TRACKER", "bytetrack.yaml")).strip() or "bytetrack.yaml"
 TRACKER_BACKEND = str(os.getenv("FALL_TRACKER_BACKEND", "deepsort")).strip().lower()
+TRACK_FRAME_STRIDE = max(1, int(os.getenv("FALL_TRACK_FRAME_STRIDE", "1")))
+TRACK_REUSE_IOU_TH = float(os.getenv("FALL_TRACK_REUSE_IOU_TH", "0.35"))
 DEEPSORT_MAX_AGE = int(os.getenv("FALL_DEEPSORT_MAX_AGE", "30"))
 DEEPSORT_N_INIT = int(os.getenv("FALL_DEEPSORT_N_INIT", "3"))
 DEEPSORT_MAX_IOU_DISTANCE = float(os.getenv("FALL_DEEPSORT_MAX_IOU_DISTANCE", "0.7"))
+
+FALL_PERF_INFER_ONLY = str(os.getenv("FALL_PERF_INFER_ONLY", "0")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+DRAW_OVERLAYS = str(os.getenv("FALL_DRAW_OVERLAYS", "1")).strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+DRAW_SUPPORT_OBJECTS = str(os.getenv("FALL_DRAW_SUPPORT_OBJECTS", "1")).strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+DRAW_NORMAL_BOXES = str(os.getenv("FALL_DRAW_NORMAL_BOXES", "1")).strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+DRAW_DWELL_TEXT = str(os.getenv("FALL_DRAW_DWELL_TEXT", "0")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+DRAW_KEYPOINT_MODE = str(os.getenv("FALL_DRAW_KEYPOINT_MODE", "fall-only")).strip().lower() or "fall-only"
+if DRAW_KEYPOINT_MODE not in {"none", "fall-only", "all"}:
+    DRAW_KEYPOINT_MODE = "fall-only"
+DRAW_HUD_EVERY_N_FRAMES = max(1, int(os.getenv("FALL_DRAW_HUD_EVERY_N_FRAMES", "2")))
+PROFILE_PRINT_INTERVAL = max(0, int(os.getenv("FALL_PROFILE_PRINT_INTERVAL", "0")))
 
 if TRACKER_BACKEND == "deepsort" and DeepSort is None:
     print("[WARN] DeepSORT 依赖未安装，自动回退到 ByteTrack(ultralytics tracker)。")
@@ -432,6 +478,15 @@ camera_frame_buffers = {
 }
 camera_pending_clips = {entry["camera_key"]: [] for entry in camera_entries}
 camera_fall_counts = {entry["camera_key"]: 0 for entry in camera_entries}
+camera_last_track_boxes: dict[str, dict[int, tuple[float, float, float, float]]] = {
+    entry["camera_key"]: {} for entry in camera_entries
+}
+camera_virtual_track_next: dict[str, int] = {
+    entry["camera_key"]: 100000 for entry in camera_entries
+}
+clip_write_queue: queue.Queue | None = None
+clip_writer_stop_event = threading.Event()
+clip_writer_thread: threading.Thread | None = None
 warned_no_keypoints = False
 
 def get_posture(keypoints, horizontal_ratio_th):
@@ -1119,6 +1174,45 @@ def bbox_iou(box_a, box_b):
     area_b = max(1.0, (bx2 - bx1) * (by2 - by1))
     return inter_area / (area_a + area_b - inter_area + 1e-6)
 
+
+def _assign_track_ids_from_previous(camera_key: str, boxes: list[tuple[float, float, float, float]]) -> list[int]:
+    prev_boxes = camera_last_track_boxes.get(camera_key, {})
+    used_prev_ids = set()
+    assigned_ids: list[int] = []
+
+    for box in boxes:
+        best_id = -1
+        best_iou = 0.0
+        for prev_id, prev_box in prev_boxes.items():
+            if prev_id in used_prev_ids:
+                continue
+            iou = bbox_iou(box, prev_box)
+            if iou > best_iou:
+                best_iou = iou
+                best_id = int(prev_id)
+
+        if best_id >= 0 and best_iou >= TRACK_REUSE_IOU_TH:
+            assigned_ids.append(best_id)
+            used_prev_ids.add(best_id)
+        else:
+            new_id = int(camera_virtual_track_next.get(camera_key, 100000))
+            camera_virtual_track_next[camera_key] = new_id + 1
+            assigned_ids.append(new_id)
+
+    return assigned_ids
+
+
+def _update_track_box_cache(camera_key: str, track_ids: list[int], boxes: list[tuple[float, float, float, float]]) -> None:
+    updated: dict[int, tuple[float, float, float, float]] = {}
+    for idx, box in enumerate(boxes):
+        if idx >= len(track_ids):
+            continue
+        x1, y1, x2, y2 = box
+        if (x2 - x1) < 1.0 or (y2 - y1) < 1.0:
+            continue
+        updated[int(track_ids[idx])] = (float(x1), float(y1), float(x2), float(y2))
+    camera_last_track_boxes[camera_key] = updated
+
 def is_duplicate_person_bbox(box_a, box_b, frame_w, frame_h):
     iou = bbox_iou(box_a, box_b)
     if iou > DUPLICATE_IOU_TH:
@@ -1318,6 +1412,55 @@ def _write_clip_file(frames: list, file_path: Path, fps: int) -> bool:
     return True
 
 
+def _ensure_clip_writer_started() -> None:
+    global clip_write_queue, clip_writer_thread
+    if not EVENT_CLIP_ASYNC_WRITE:
+        return
+    if clip_writer_thread is not None and clip_writer_thread.is_alive():
+        return
+
+    clip_write_queue = queue.Queue(maxsize=EVENT_CLIP_QUEUE_SIZE)
+
+    def _worker() -> None:
+        while not clip_writer_stop_event.is_set():
+            try:
+                job = clip_write_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            if job is None:
+                clip_write_queue.task_done()
+                break
+
+            saved = _write_clip_file(job["frames"], job["file_path"], job["fps"])
+            if not saved:
+                print(f"[clip] async save failed: camera={job['camera_key']} file={job['file_path'].name}")
+            clip_write_queue.task_done()
+
+    clip_writer_thread = threading.Thread(target=_worker, daemon=True)
+    clip_writer_thread.start()
+
+
+def _dispatch_clip_write(camera_key: str, item: dict) -> None:
+    if EVENT_CLIP_ASYNC_WRITE:
+        _ensure_clip_writer_started()
+        if clip_write_queue is not None:
+            try:
+                clip_write_queue.put_nowait({
+                    "camera_key": camera_key,
+                    "file_path": item["file_path"],
+                    "frames": item["frames"],
+                    "fps": EVENT_CLIP_FPS,
+                })
+                return
+            except queue.Full:
+                print(f"[clip] queue full, fallback sync write: {item['file_path'].name}")
+
+    saved = _write_clip_file(item["frames"], item["file_path"], EVENT_CLIP_FPS)
+    if not saved:
+        print(f"[clip] save failed: camera={camera_key} file={item['file_path'].name}")
+
+
 def update_pending_event_clips(camera_key: str, frame) -> None:
     pending = camera_pending_clips.get(camera_key, [])
     if not pending:
@@ -1328,9 +1471,7 @@ def update_pending_event_clips(camera_key: str, frame) -> None:
         item["frames"].append(frame.copy())
         item["post_left"] -= 1
         if item["post_left"] <= 0:
-            saved = _write_clip_file(item["frames"], item["file_path"], EVENT_CLIP_FPS)
-            if not saved:
-                print(f"[clip] save failed: camera={camera_key} file={item['file_path'].name}")
+            _dispatch_clip_write(camera_key, item)
             done_indexes.append(idx)
 
     for idx in reversed(done_indexes):
@@ -1590,19 +1731,41 @@ while True:
     update_pending_event_clips(camera_key, frame)
 
     estimated_pitch = CAMERA_PITCH_ANGLE
+    stage_after_infer_t = 0.0
 
     # 跟踪后端：ultralytics(默认) 或 deepsort
     infer_start_t = time.perf_counter()
+    used_tracker_this_frame = True
     if TRACKER_BACKEND == "deepsort":
         results = model(frame, verbose=False)[0]
     else:
-        results = model.track(frame, persist=TRACK_PERSIST, tracker=TRACKER_CFG, verbose=False)[0]
+        if TRACK_FRAME_STRIDE > 1 and (frame_index % TRACK_FRAME_STRIDE != 0):
+            results = model(frame, verbose=False)[0]
+            used_tracker_this_frame = False
+        else:
+            results = model.track(frame, persist=TRACK_PERSIST, tracker=TRACKER_CFG, verbose=False)[0]
     infer_end_t = time.perf_counter()
+    stage_after_infer_t = infer_end_t
 
     if hasattr(results, "speed") and isinstance(results.speed, dict):
         inference_ms = float(results.speed.get("inference", 0.0))
     else:
         inference_ms = (infer_end_t - infer_start_t) * 1000.0
+
+    if FALL_PERF_INFER_ONLY:
+        frame_ms = (time.perf_counter() - frame_start_t) * 1000.0
+        instant_fps = 1000.0 / max(1e-6, frame_ms)
+        if fps_ema <= 0.0:
+            fps_ema = instant_fps
+        else:
+            fps_ema = FPS_EMA_ALPHA * instant_fps + (1.0 - FPS_EMA_ALPHA) * fps_ema
+
+        cv2.putText(frame, f"PERF-INFER-ONLY FPS: {fps_ema:.1f} Infer: {inference_ms:.1f} ms", (20, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+        cv2.imshow(f"Smart AI Fall Detection - {camera_key}", frame)
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
+        continue
 
     alert_text = ""
 
@@ -1621,9 +1784,10 @@ while True:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             objects.append((x1, y1, x2, y2, label))
 
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 0), 2)
-            cv2.putText(frame, label, (x1, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            if DRAW_OVERLAYS and DRAW_SUPPORT_OBJECTS:
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 0), 2)
+                cv2.putText(frame, label, (x1, y1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
     # 2️⃣ 姿态 + 跌倒检测
     person_count = 0
@@ -1662,6 +1826,8 @@ while True:
         if TRACKER_BACKEND == "ultralytics":
             if results.boxes is not None and results.boxes.id is not None:
                 track_ids = results.boxes.id.int().cpu().tolist()
+            else:
+                track_ids = _assign_track_ids_from_previous(camera_key, keypoint_boxes)
         elif TRACKER_BACKEND == "deepsort" and camera_key in camera_trackers:
             detections = []
             det_indices = []
@@ -1695,6 +1861,8 @@ while True:
                 if best_idx >= 0 and best_iou >= 0.1:
                     track_ids[best_idx] = int(trk.track_id)
                     used_det.add(best_idx)
+
+        _update_track_box_cache(camera_key, [int(tid) for tid in track_ids], keypoint_boxes)
 
         frame_h, frame_w = frame.shape[:2]
         # 先收集候选人体，再做同帧去重，最后进入状态机
@@ -2167,24 +2335,31 @@ while True:
                     state["unrecovered_sent"] = True
 
             # 5️⃣ 可视化
-            for x, y in keypoints:
-                cv2.circle(frame, (int(x), int(y)), 3, (255, 0, 0), -1)
-
-            cv2.rectangle(frame,
-                        (int(x_min), int(y_min)),
-                        (int(x_max), int(y_max)),
-                        color, 2)
-
-            if state.get("dwell_30s_noted"):
-                cv2.putText(
-                    frame,
-                    f"Track {track_id[1] if isinstance(track_id, tuple) else track_id}: stay {int(dwell_seconds)}s",
-                    (int(x_min), max(20, int(y_min) - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (0, 165, 255),
-                    2,
+            if DRAW_OVERLAYS:
+                draw_keypoints = (
+                    DRAW_KEYPOINT_MODE == "all"
+                    or (DRAW_KEYPOINT_MODE == "fall-only" and state["fall_state"] == "FALLEN")
                 )
+                if draw_keypoints:
+                    for x, y in keypoints:
+                        cv2.circle(frame, (int(x), int(y)), 3, (255, 0, 0), -1)
+
+                if DRAW_NORMAL_BOXES or state["fall_state"] == "FALLEN":
+                    cv2.rectangle(frame,
+                                (int(x_min), int(y_min)),
+                                (int(x_max), int(y_max)),
+                                color, 2)
+
+                if DRAW_DWELL_TEXT and state.get("dwell_30s_noted"):
+                    cv2.putText(
+                        frame,
+                        f"Track {track_id[1] if isinstance(track_id, tuple) else track_id}: stay {int(dwell_seconds)}s",
+                        (int(x_min), max(20, int(y_min) - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (0, 165, 255),
+                        2,
+                    )
 
     # 清理已消失目标，防止状态无限增长
     stale_ids = [
@@ -2202,17 +2377,6 @@ while True:
             if c0 is not None and c1 is not None:
                 push_recent_identity(elder_code, float(c0), float(c1), frame_index, camera_key)
 
-    # 3️⃣ UI统计信息
-    cv2.putText(frame, f"Persons: {person_count}", (20, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-    cv2.putText(frame, f"Falls: {camera_fall_counts.get(camera_key, 0)}", (20, 60),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
-    mode_text = "(Auto)" if AUTO_DETECT_CAMERA_ANGLE else "(Manual)"
-    cv2.putText(frame, f"Cam Pitch: ~{int(estimated_pitch)} deg {mode_text}", (20, 90),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2)
-
     frame_ms = (time.perf_counter() - frame_start_t) * 1000.0
     instant_fps = 1000.0 / max(1e-6, frame_ms)
     if fps_ema <= 0.0:
@@ -2220,14 +2384,33 @@ while True:
     else:
         fps_ema = FPS_EMA_ALPHA * instant_fps + (1.0 - FPS_EMA_ALPHA) * fps_ema
 
-    cv2.putText(frame, f"FPS: {fps_ema:.1f}", (20, 120),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-    cv2.putText(frame, f"Infer: {inference_ms:.1f} ms  Frame: {frame_ms:.1f} ms", (20, 150),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 215, 255), 2)
+    if DRAW_OVERLAYS and (frame_index % DRAW_HUD_EVERY_N_FRAMES == 0):
+        # 3️⃣ UI统计信息
+        cv2.putText(frame, f"Persons: {person_count}", (20, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-    if alert_text:
-        cv2.putText(frame, alert_text, (50, 180),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+        cv2.putText(frame, f"Falls: {camera_fall_counts.get(camera_key, 0)}", (20, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        mode_text = "(Auto)" if AUTO_DETECT_CAMERA_ANGLE else "(Manual)"
+        cv2.putText(frame, f"Cam Pitch: ~{int(estimated_pitch)} deg {mode_text}", (20, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2)
+
+        cv2.putText(frame, f"FPS: {fps_ema:.1f}", (20, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(frame, f"Infer: {inference_ms:.1f} ms  Frame: {frame_ms:.1f} ms", (20, 150),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 215, 255), 2)
+
+        if alert_text:
+            cv2.putText(frame, alert_text, (50, 180),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+
+    if PROFILE_PRINT_INTERVAL > 0 and frame_index % PROFILE_PRINT_INTERVAL == 0:
+        post_ms = max(0.0, (time.perf_counter() - stage_after_infer_t) * 1000.0)
+        print(
+            f"[perf] cam={camera_key} tracker={'on' if used_tracker_this_frame else 'skip'} "
+            f"persons={person_count} infer={inference_ms:.1f}ms post={post_ms:.1f}ms frame={frame_ms:.1f}ms"
+        )
 
     cv2.imshow(f"Smart AI Fall Detection - {camera_key}", frame)
 
@@ -2243,4 +2426,14 @@ for entry in camera_entries:
         entry["capture"].release()
     except Exception:
         pass
+
+if clip_write_queue is not None:
+    clip_writer_stop_event.set()
+    try:
+        clip_write_queue.put_nowait(None)
+    except Exception:
+        pass
+if clip_writer_thread is not None:
+    clip_writer_thread.join(timeout=2.0)
+
 cv2.destroyAllWindows()
