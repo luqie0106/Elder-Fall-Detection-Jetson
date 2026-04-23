@@ -1,0 +1,4 @@
+# Optional C++ acceleration build dependencies
+pybind11>=2.11.1
+setuptools>=65.0.0
+wheel>=0.40.0

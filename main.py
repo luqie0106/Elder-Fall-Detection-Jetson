@@ -9,6 +9,7 @@ import os
 import subprocess
 import queue
 import threading
+import signal
 import importlib
 from pathlib import Path
 from collections import deque
@@ -25,10 +26,19 @@ try:
 except Exception:
     report_fall_event = None
 
-try:
-    from services.face_recognition_service import get_default_face_service
-except Exception:
-    get_default_face_service = None
+ENABLE_FACE_RECOG = str(os.getenv("FALL_ENABLE_FACE_RECOG", "0")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+get_default_face_service = None
+if ENABLE_FACE_RECOG:
+    try:
+        from services.face_recognition_service import get_default_face_service
+    except Exception:
+        get_default_face_service = None
 
 try:
     from storage.events_db import ensure_elder, update_elder_avatar, insert_person_entry
@@ -36,6 +46,11 @@ except Exception:
     ensure_elder = None
     update_elder_avatar = None
     insert_person_entry = None
+
+try:
+    from services.cpp_accel import load_cpp_accel
+except Exception:
+    load_cpp_accel = None
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = str(PROJECT_ROOT / "data" / "fall_events.db")
@@ -95,6 +110,8 @@ if get_default_face_service is not None:
         face_service = get_default_face_service()
     except Exception:
         face_service = None
+elif not ENABLE_FACE_RECOG:
+    print("[face] 人脸识别已禁用（FALL_ENABLE_FACE_RECOG=0）。")
 
 
 def _parse_camera_sources() -> list[str | int]:
@@ -183,12 +200,16 @@ EVENT_CLIP_AUTO_FIX_BROWSER = str(os.getenv("FALL_CLIP_AUTO_FIX_BROWSER", "1")).
 }
 TRACK_PERSIST = len(camera_entries) <= 1
 TRACKER_CFG = str(os.getenv("FALL_TRACKER", "bytetrack.yaml")).strip() or "bytetrack.yaml"
-TRACKER_BACKEND = str(os.getenv("FALL_TRACKER_BACKEND", "deepsort")).strip().lower()
+TRACKER_BACKEND = str(os.getenv("FALL_TRACKER_BACKEND", "ultralytics")).strip().lower()
 TRACK_FRAME_STRIDE = max(1, int(os.getenv("FALL_TRACK_FRAME_STRIDE", "1")))
 TRACK_REUSE_IOU_TH = float(os.getenv("FALL_TRACK_REUSE_IOU_TH", "0.35"))
 DEEPSORT_MAX_AGE = int(os.getenv("FALL_DEEPSORT_MAX_AGE", "30"))
 DEEPSORT_N_INIT = int(os.getenv("FALL_DEEPSORT_N_INIT", "3"))
 DEEPSORT_MAX_IOU_DISTANCE = float(os.getenv("FALL_DEEPSORT_MAX_IOU_DISTANCE", "0.7"))
+
+if TRACKER_BACKEND not in {"deepsort", "ultralytics"}:
+    print(f"[WARN] 未知 TRACKER_BACKEND={TRACKER_BACKEND}，自动回退到 ultralytics。")
+    TRACKER_BACKEND = "ultralytics"
 
 FALL_PERF_INFER_ONLY = str(os.getenv("FALL_PERF_INFER_ONLY", "0")).strip().lower() in {
     "1",
@@ -225,6 +246,30 @@ if DRAW_KEYPOINT_MODE not in {"none", "fall-only", "all"}:
     DRAW_KEYPOINT_MODE = "fall-only"
 DRAW_HUD_EVERY_N_FRAMES = max(1, int(os.getenv("FALL_DRAW_HUD_EVERY_N_FRAMES", "2")))
 PROFILE_PRINT_INTERVAL = max(0, int(os.getenv("FALL_PROFILE_PRINT_INTERVAL", "0")))
+USE_CPP_ACCEL = str(os.getenv("FALL_USE_CPP_ACCEL", "0")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+cpp_accel_module = None
+CPP_ACCEL_ENABLED = False
+if USE_CPP_ACCEL:
+    if load_cpp_accel is None:
+        print("[cpp] FALL_USE_CPP_ACCEL=1 但加载器不可用，继续使用 Python 路径。")
+    else:
+        cpp_accel_module, cpp_msg = load_cpp_accel()
+        if cpp_accel_module is None:
+            print(
+                "[cpp] FALL_USE_CPP_ACCEL=1 但未加载到 cpp_accel_impl，继续使用 Python 路径。"
+                "可执行: python3 cpp_accel/build_cpp_accel.py build_ext --inplace"
+            )
+            if cpp_msg:
+                print(f"[cpp] load error: {cpp_msg}")
+        else:
+            CPP_ACCEL_ENABLED = True
+            print("[cpp] C++ acceleration enabled (cpp_accel_impl)")
 
 if TRACKER_BACKEND == "deepsort" and DeepSort is None:
     print("[WARN] DeepSORT 依赖未安装，自动回退到 ByteTrack(ultralytics tracker)。")
@@ -232,13 +277,18 @@ if TRACKER_BACKEND == "deepsort" and DeepSort is None:
 
 camera_trackers: dict[str, Any] = {}
 if TRACKER_BACKEND == "deepsort" and DeepSort is not None:
-    for entry in camera_entries:
-        camera_key = str(entry["camera_key"])
-        camera_trackers[camera_key] = DeepSort(
-            max_age=DEEPSORT_MAX_AGE,
-            n_init=DEEPSORT_N_INIT,
-            max_iou_distance=DEEPSORT_MAX_IOU_DISTANCE,
-        )
+    try:
+        for entry in camera_entries:
+            camera_key = str(entry["camera_key"])
+            camera_trackers[camera_key] = DeepSort(
+                max_age=DEEPSORT_MAX_AGE,
+                n_init=DEEPSORT_N_INIT,
+                max_iou_distance=DEEPSORT_MAX_IOU_DISTANCE,
+            )
+    except Exception as error:
+        print(f"[WARN] DeepSORT 初始化失败，自动回退到 ByteTrack: {error}")
+        camera_trackers.clear()
+        TRACKER_BACKEND = "ultralytics"
 
 if TRACKER_BACKEND == "deepsort":
     print(
@@ -488,6 +538,15 @@ clip_write_queue: queue.Queue | None = None
 clip_writer_stop_event = threading.Event()
 clip_writer_thread: threading.Thread | None = None
 warned_no_keypoints = False
+interrupt_requested = False
+
+
+def _handle_sigint(_signum, _frame) -> None:
+    global interrupt_requested
+    interrupt_requested = True
+
+
+signal.signal(signal.SIGINT, _handle_sigint)
 
 def get_posture(keypoints, horizontal_ratio_th):
     valid_xy = keypoints[(keypoints[:, 0] > 0) & (keypoints[:, 1] > 0)]
@@ -520,6 +579,18 @@ def valid_person(keypoints):
     """
     过滤无效人体（防止头/衣服误检）
     """
+
+    if CPP_ACCEL_ENABLED and cpp_accel_module is not None:
+        try:
+            return bool(
+                cpp_accel_module.valid_person(
+                    np.asarray(keypoints, dtype=np.float32),
+                    int(VALID_PERSON_MIN_KEYPOINTS),
+                    float(VALID_PERSON_MIN_HEIGHT),
+                )
+            )
+        except Exception:
+            pass
 
     # 统计有效关键点（非0）
     valid_points = 0
@@ -1158,6 +1229,12 @@ pitch_history = []
 pitch_baseline = None
 
 def bbox_iou(box_a, box_b):
+    if CPP_ACCEL_ENABLED and cpp_accel_module is not None:
+        try:
+            return float(cpp_accel_module.bbox_iou(box_a, box_b))
+        except Exception:
+            pass
+
     ax1, ay1, ax2, ay2 = box_a
     bx1, by1, bx2, by2 = box_b
 
@@ -1214,6 +1291,26 @@ def _update_track_box_cache(camera_key: str, track_ids: list[int], boxes: list[t
     camera_last_track_boxes[camera_key] = updated
 
 def is_duplicate_person_bbox(box_a, box_b, frame_w, frame_h):
+    if CPP_ACCEL_ENABLED and cpp_accel_module is not None:
+        try:
+            return bool(
+                cpp_accel_module.is_duplicate_person_bbox(
+                    box_a,
+                    box_b,
+                    float(frame_w),
+                    float(frame_h),
+                    float(DUPLICATE_IOU_TH),
+                    float(DUPLICATE_CENTER_DX_RATIO_TH),
+                    float(DUPLICATE_CENTER_DY_RATIO_TH),
+                    float(DUPLICATE_X_OVERLAP_RATIO_TH),
+                    float(DUPLICATE_VERTICAL_GAP_RATIO_TH),
+                    float(DUPLICATE_SPLIT_CENTER_DX_RATIO_TH),
+                    float(DUPLICATE_CONTAIN_RATIO_TH),
+                )
+            )
+        except Exception:
+            pass
+
     iou = bbox_iou(box_a, box_b)
     if iou > DUPLICATE_IOU_TH:
         return True
@@ -1703,6 +1800,10 @@ def save_elder_avatar(frame, keypoints, bbox, elder_code: str, state: dict) -> N
         state["avatar_best_score"] = score
 
 while True:
+    if interrupt_requested:
+        print("[INFO] 收到 Ctrl+C，正在退出...")
+        break
+
     if not camera_entries:
         break
 
@@ -1744,6 +1845,11 @@ while True:
             used_tracker_this_frame = False
         else:
             results = model.track(frame, persist=TRACK_PERSIST, tracker=TRACKER_CFG, verbose=False)[0]
+
+    if interrupt_requested:
+        print("[INFO] 收到 Ctrl+C，正在退出...")
+        break
+
     infer_end_t = time.perf_counter()
     stage_after_infer_t = infer_end_t
 

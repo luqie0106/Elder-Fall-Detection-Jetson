@@ -1,0 +1,2 @@
+# Compatibility entry: use requirements/cpp.txt
+-r requirements/cpp.txt

@@ -153,6 +153,39 @@ FALL_CAMERA_SOURCES=0,1 FALL_CLIP_PRE_SECONDS=5 FALL_CLIP_POST_SECONDS=5 python3
 - `FALL_MODEL_PATH`：可选模型路径或模型名（例如 `/path/to/yolov8n-pose.engine` 或 `yolov8n-pose.pt`）。
 - `FALL_MODEL_DEFAULT`：默认回退模型名（本地无模型且未指定有效 `FALL_MODEL_PATH` 时使用，默认 `yolov8n-pose.pt`）。
 
+### 2.x 可选：启用 C++ 计算加速（高频几何与过滤）
+
+项目已支持可选 C++ 加速层（默认关闭），用于加速高频 CPU 计算：
+
+- `bbox_iou`
+- 同帧重复框判定 `is_duplicate_person_bbox`
+- 人体有效性判定 `valid_person`
+
+#### 安装构建依赖
+
+```bash
+pip install -r requirements/cpp.txt
+```
+
+#### 编译扩展模块
+
+```bash
+cd /path/to/aix_contest
+python3 cpp_accel/build_cpp_accel.py build_ext --inplace
+```
+
+编译成功后，工程根目录会生成 `cpp_accel_impl` 动态库文件。
+
+#### 运行时开关
+
+```bash
+cd /path/to/aix_contest
+FALL_USE_CPP_ACCEL=1 python3 main.py
+```
+
+- `FALL_USE_CPP_ACCEL=0`（默认）：使用纯 Python 路径
+- `FALL_USE_CPP_ACCEL=1`：优先使用 C++，若模块未编译会自动回退 Python
+
 示例（显式指定模型）：
 
 ```bash
@@ -188,21 +221,21 @@ cd /path/to/aix_contest
 FALL_MODEL_PATH=/path/to/your/model.engine python3 main.py
 ```
 
-支持切换跟踪后端（默认 `deepsort`，若未安装依赖会自动回退到 `ultralytics` / ByteTrack）：
+支持切换跟踪后端（默认 `ultralytics` / ByteTrack；若显式选择 `deepsort` 但依赖缺失，会自动回退）：
 
 ```bash
 cd /path/to/aix_contest
 FALL_TRACKER_BACKEND=deepsort python3 main.py
 ```
 
-默认运行无需额外参数（会优先尝试 DeepSORT）：
+默认运行无需额外参数（使用 ultralytics / ByteTrack）：
 
 ```bash
 cd /path/to/aix_contest
 python3 main.py
 ```
 
-推荐使用虚拟环境解释器运行 DeepSORT：
+若需 DeepSORT，建议使用虚拟环境解释器运行：
 
 ```bash
 cd /path/to/aix_contest
@@ -238,6 +271,18 @@ pip install -r requirements/face.txt
 兼容说明：根目录仍保留 `requirements.txt`、`requirements-jetson.txt`、`requirements-face.txt` 作为入口别名。
 
 启用后，系统会为识别到的人脸自动分配编号（如 `E001`、`E002`），并在告警记录里展示该编号。
+
+默认情况下人脸识别是关闭的，避免在未使用该能力时触发额外依赖导入：
+
+```bash
+FALL_ENABLE_FACE_RECOG=0 python3 main.py
+```
+
+需要启用时再显式打开：
+
+```bash
+FALL_ENABLE_FACE_RECOG=1 python3 main.py
+```
 
 ### 2.2 多级告警策略（已接入）
 
