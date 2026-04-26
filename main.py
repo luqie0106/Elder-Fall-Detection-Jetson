@@ -333,6 +333,15 @@ if USE_CPP_ACCEL:
         else:
             CPP_ACCEL_ENABLED = True
             print("[cpp] C++ acceleration enabled (cpp_accel_impl)")
+            if hasattr(cpp_accel_module, "openmp_version"):
+                try:
+                    omp_ver = int(cpp_accel_module.openmp_version())
+                except Exception:
+                    omp_ver = 0
+                if omp_ver > 0:
+                    print(f"[cpp] OpenMP enabled (_OPENMP={omp_ver})")
+                else:
+                    print("[cpp] OpenMP disabled; using single-thread C++ path")
 
 if TRACKER_BACKEND == "deepsort" and DeepSort is None:
     print("[WARN] DeepSORT 依赖未安装，自动回退到 ByteTrack(ultralytics tracker)。")

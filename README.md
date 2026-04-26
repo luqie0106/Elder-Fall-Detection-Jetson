@@ -165,6 +165,8 @@ FALL_CAMERA_SOURCES=0,1 FALL_CLIP_PRE_SECONDS=5 FALL_CLIP_POST_SECONDS=5 python3
 - 人体有效性判定 `valid_person`
 - 批量人体有效性判定 `valid_person_batch`
 
+另外已加入 OpenMP 并行支持（主要用于批量人体有效性判定路径）。
+
 #### 安装构建依赖
 
 ```bash
@@ -179,6 +181,27 @@ python3 cpp_accel/build_cpp_accel.py build_ext --inplace
 ```
 
 编译成功后，工程根目录会生成 `cpp_accel_impl` 动态库文件。
+
+#### OpenMP 说明
+
+- Linux（含 Jetson）：默认开启 OpenMP 编译/链接。
+- macOS / Windows：默认不强制开启；可通过环境变量手动打开。
+- 构建开关：`FALL_CPP_ACCEL_OMP=1|0`（默认在 Linux 为开启，其他平台为关闭）。
+
+示例（Linux 强制开启 OpenMP 编译）：
+
+```bash
+cd /path/to/aix_contest
+FALL_CPP_ACCEL_OMP=1 python3 cpp_accel/build_cpp_accel.py build_ext --inplace
+```
+
+运行时若 C++ 加速加载成功，日志会打印 OpenMP 宏版本，例如：
+
+```text
+[cpp] OpenMP enabled (_OPENMP=201511)
+```
+
+若显示 `OpenMP disabled`，表示当前扩展按单线程 C++ 路径运行。
 
 #### 运行时开关
 

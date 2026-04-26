@@ -6,6 +6,10 @@
 #include <cmath>
 #include <stdexcept>
 
+#if defined(CPP_ACCEL_USE_OPENMP) && defined(_OPENMP)
+#include <omp.h>
+#endif
+
 namespace py = pybind11;
 
 namespace {
@@ -95,8 +99,12 @@ py::array_t<bool> valid_person_batch(
     const float* ptr = static_cast<float*>(buf.ptr);
 
     py::array_t<bool> result(people);
-    auto out = result.mutable_unchecked<1>();
+    const auto out_buf = result.request();
+    auto* out_ptr = static_cast<bool*>(out_buf.ptr);
 
+#if defined(CPP_ACCEL_USE_OPENMP) && defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(people >= 8)
+#endif
     for (int p = 0; p < people; ++p) {
         int valid_points = 0;
         float y_min = 1e9f;
@@ -119,10 +127,18 @@ py::array_t<bool> valid_person_batch(
             const float height = y_max - y_min;
             is_valid = height >= min_height;
         }
-        out(p) = is_valid;
+        out_ptr[p] = is_valid;
     }
 
     return result;
+}
+
+int openmp_version() {
+#if defined(CPP_ACCEL_USE_OPENMP) && defined(_OPENMP)
+    return _OPENMP;
+#else
+    return 0;
+#endif
 }
 
 bool is_duplicate_person_bbox(
@@ -207,6 +223,7 @@ PYBIND11_MODULE(cpp_accel_impl, m) {
         py::arg("min_height"),
         "Fast batched valid person check"
     );
+    m.def("openmp_version", &openmp_version, "Return OpenMP macro version (0 when disabled)");
     m.def(
         "is_duplicate_person_bbox",
         &is_duplicate_person_bbox,
