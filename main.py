@@ -115,8 +115,18 @@ elif not ENABLE_FACE_RECOG:
 
 
 def _parse_camera_sources() -> list[str | int]:
-    raw = str(os.getenv("FALL_CAMERA_SOURCES", "0")).strip()
+    raw = str(os.getenv("FALL_CAMERA_SOURCES", "")).strip()
     if not raw:
+        # Linux 上默认扫描 /dev/video*，避免仅尝试 index=0 导致可用设备被漏掉。
+        if os.name == "posix":
+            auto_sources: list[str | int] = []
+            for device_path in sorted(Path("/dev").glob("video*")):
+                name = device_path.name
+                if len(name) > 5 and name[5:].isdigit():
+                    auto_sources.append(str(device_path))
+            if auto_sources:
+                print(f"[camera] FALL_CAMERA_SOURCES 未设置，自动扫描到: {auto_sources}")
+                return auto_sources
         return [0]
     parts = [item.strip() for item in raw.split(",") if item.strip()]
     result: list[str | int] = []
@@ -128,19 +138,72 @@ def _parse_camera_sources() -> list[str | int]:
     return result or [0]
 
 
+def _build_camera_attempts(source: str | int) -> list[tuple[str, str | int, int | None]]:
+    attempts: list[tuple[str, str | int, int | None]] = []
+
+    if isinstance(source, int):
+        attempts.append(("index-default", source, None))
+        attempts.append(("index-v4l2", source, cv2.CAP_V4L2))
+        if os.name == "posix":
+            dev_path = f"/dev/video{source}"
+            attempts.append(("dev-default", dev_path, None))
+            attempts.append(("dev-v4l2", dev_path, cv2.CAP_V4L2))
+        return attempts
+
+    source_str = str(source).strip()
+    if source_str.lstrip("-").isdigit():
+        return _build_camera_attempts(int(source_str))
+
+    attempts.append(("source-default", source_str, None))
+
+    if os.name == "posix" and source_str.startswith("/dev/video"):
+        attempts.append(("source-v4l2", source_str, cv2.CAP_V4L2))
+
+    return attempts
+
+
+def _open_camera_source(source: str | int) -> tuple[Any | None, str]:
+    failure_tags: list[str] = []
+    for tag, actual_source, backend in _build_camera_attempts(source):
+        try:
+            if backend is None:
+                cap = cv2.VideoCapture(actual_source)
+            else:
+                cap = cv2.VideoCapture(actual_source, backend)
+        except Exception as exc:
+            failure_tags.append(f"{tag}:{exc}")
+            continue
+
+        if cap is not None and cap.isOpened():
+            backend_name = "default" if backend is None else str(backend)
+            return cap, f"opened via {tag} source={actual_source} backend={backend_name}"
+
+        if cap is not None:
+            cap.release()
+        failure_tags.append(tag)
+
+    return None, ", ".join(failure_tags) if failure_tags else "no-attempt"
+
+
 CAMERA_SOURCES = _parse_camera_sources()
 camera_entries: list[dict] = []
 for index, source in enumerate(CAMERA_SOURCES):
-    cap = cv2.VideoCapture(source)
-    if cap is not None and cap.isOpened():
+    cap, open_msg = _open_camera_source(source)
+    if cap is not None:
+        print(f"[camera] source={source} {open_msg}")
         camera_entries.append({
             "camera_key": f"cam-{index}",
             "camera_source": source,
             "capture": cap,
         })
+    else:
+        print(f"[camera] source={source} open failed ({open_msg})")
 
 if not camera_entries:
-    raise RuntimeError("没有可用摄像头，请检查 FALL_CAMERA_SOURCES 配置。")
+    raise RuntimeError(
+        "没有可用摄像头。请检查 FALL_CAMERA_SOURCES（例如 /dev/video1 或 0,1），"
+        "并确认当前用户有 video 组权限。"
+    )
 
 camera_latest_frames: dict[str, np.ndarray | None] = {entry["camera_key"]: None for entry in camera_entries}
 camera_locks: dict[str, threading.Lock] = {entry["camera_key"]: threading.Lock() for entry in camera_entries}
