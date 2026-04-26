@@ -147,19 +147,23 @@ cd /path/to/aix_contest
 FALL_CAMERA_SOURCES=0,1 FALL_CLIP_PRE_SECONDS=5 FALL_CLIP_POST_SECONDS=5 python3 main.py
 ```
 
-- `FALL_CAMERA_SOURCES`：摄像头列表，逗号分隔，支持本地索引和 RTSP/HTTP 地址。
+未设置 `FALL_CAMERA_SOURCES` 时，程序会在 Linux 上自动扫描 `/dev/video*` 并按顺序尝试打开；
+若未扫描到设备，则回退到索引 `0`。
+
+- `FALL_CAMERA_SOURCES`：摄像头列表，逗号分隔，支持本地索引、`/dev/videoX` 和 RTSP/HTTP 地址。
 - `FALL_CLIP_PRE_SECONDS`：跌倒前视频秒数，范围 `3~5`。
 - `FALL_CLIP_POST_SECONDS`：跌倒后视频秒数，范围 `3~5`。
 - `FALL_MODEL_PATH`：可选模型路径或模型名（例如 `/path/to/yolov8n-pose.engine` 或 `yolov8n-pose.pt`）。
 - `FALL_MODEL_DEFAULT`：默认回退模型名（本地无模型且未指定有效 `FALL_MODEL_PATH` 时使用，默认 `yolov8n-pose.pt`）。
 
-### 2.x 可选：启用 C++ 计算加速（高频几何与过滤）
+### 2.x C++ 计算加速（默认开启，失败自动回退）
 
-项目已支持可选 C++ 加速层（默认关闭），用于加速高频 CPU 计算：
+项目已支持 C++ 加速层（默认开启），用于加速高频 CPU 计算：
 
 - `bbox_iou`
 - 同帧重复框判定 `is_duplicate_person_bbox`
 - 人体有效性判定 `valid_person`
+- 批量人体有效性判定 `valid_person_batch`
 
 #### 安装构建依赖
 
@@ -178,13 +182,33 @@ python3 cpp_accel/build_cpp_accel.py build_ext --inplace
 
 #### 运行时开关
 
+默认运行（无需额外环境变量）即会优先尝试 C++：
+
+```bash
+cd /path/to/aix_contest
+python3 main.py
+```
+
+若模块未编译或加载失败，会自动回退到 Python 路径，不影响功能。
+
+显式关闭 C++（强制纯 Python 路径）：
+
+```bash
+cd /path/to/aix_contest
+FALL_USE_CPP_ACCEL=0 python3 main.py
+```
+
+显式开启 C++（与默认行为一致）：
+
 ```bash
 cd /path/to/aix_contest
 FALL_USE_CPP_ACCEL=1 python3 main.py
 ```
 
-- `FALL_USE_CPP_ACCEL=0`（默认）：使用纯 Python 路径
-- `FALL_USE_CPP_ACCEL=1`：优先使用 C++，若模块未编译会自动回退 Python
+- `FALL_USE_CPP_ACCEL=1`（默认）：优先使用 C++，若模块未编译会自动回退 Python
+- `FALL_USE_CPP_ACCEL=0`：使用纯 Python 路径
+
+提示：若你更新了 C++ 源码（例如新增接口），请重新执行一次 `build_ext --inplace`。
 
 示例（显式指定模型）：
 
@@ -319,6 +343,8 @@ FALL_CAMERA_SOURCES=0,1 python3 main.py
 cd /path/to/aix_contest
 FALL_CAMERA_SOURCES=0,rtsp://user:pass@192.168.1.10:554/stream1 python3 main.py
 ```
+
+启动时会对每个源尝试多种打开方式（索引、`/dev/videoX`、V4L2 后端），并输出逐路成功/失败日志，便于现场排障。
 
 ### 3) 启动网页查看告警记录
 
