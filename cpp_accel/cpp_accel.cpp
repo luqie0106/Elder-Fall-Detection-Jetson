@@ -79,6 +79,52 @@ bool valid_person(
     return height >= min_height;
 }
 
+py::array_t<bool> valid_person_batch(
+    py::array_t<float, py::array::c_style | py::array::forcecast> keypoints_batch,
+    int min_keypoints,
+    float min_height
+) {
+    const auto buf = keypoints_batch.request();
+    if (buf.ndim != 3 || buf.shape[0] < 0 || buf.shape[1] <= 0 || buf.shape[2] < 2) {
+        throw std::runtime_error("keypoints_batch must be [N, K, 2+]");
+    }
+
+    const auto people = static_cast<int>(buf.shape[0]);
+    const auto keypoints = static_cast<int>(buf.shape[1]);
+    const auto cols = static_cast<int>(buf.shape[2]);
+    const float* ptr = static_cast<float*>(buf.ptr);
+
+    py::array_t<bool> result(people);
+    auto out = result.mutable_unchecked<1>();
+
+    for (int p = 0; p < people; ++p) {
+        int valid_points = 0;
+        float y_min = 1e9f;
+        float y_max = -1e9f;
+
+        const int base = p * keypoints * cols;
+        for (int i = 0; i < keypoints; ++i) {
+            const int idx = base + i * cols;
+            const float x = ptr[idx + 0];
+            const float y = ptr[idx + 1];
+            if (x > 0.0f && y > 0.0f) {
+                ++valid_points;
+                y_min = std::min(y_min, y);
+                y_max = std::max(y_max, y);
+            }
+        }
+
+        bool is_valid = false;
+        if (valid_points >= min_keypoints) {
+            const float height = y_max - y_min;
+            is_valid = height >= min_height;
+        }
+        out(p) = is_valid;
+    }
+
+    return result;
+}
+
 bool is_duplicate_person_bbox(
     const py::sequence& box_a,
     const py::sequence& box_b,
@@ -152,6 +198,14 @@ PYBIND11_MODULE(cpp_accel_impl, m) {
         py::arg("min_keypoints"),
         py::arg("min_height"),
         "Fast valid person check"
+    );
+    m.def(
+        "valid_person_batch",
+        &valid_person_batch,
+        py::arg("keypoints_batch"),
+        py::arg("min_keypoints"),
+        py::arg("min_height"),
+        "Fast batched valid person check"
     );
     m.def(
         "is_duplicate_person_bbox",

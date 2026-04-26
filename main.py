@@ -309,7 +309,7 @@ if DRAW_KEYPOINT_MODE not in {"none", "fall-only", "all"}:
     DRAW_KEYPOINT_MODE = "fall-only"
 DRAW_HUD_EVERY_N_FRAMES = max(1, int(os.getenv("FALL_DRAW_HUD_EVERY_N_FRAMES", "2")))
 PROFILE_PRINT_INTERVAL = max(0, int(os.getenv("FALL_PROFILE_PRINT_INTERVAL", "0")))
-USE_CPP_ACCEL = str(os.getenv("FALL_USE_CPP_ACCEL", "0")).strip().lower() in {
+USE_CPP_ACCEL = str(os.getenv("FALL_USE_CPP_ACCEL", "1")).strip().lower() in {
     "1",
     "true",
     "yes",
@@ -674,6 +674,40 @@ def valid_person(keypoints):
         return False
 
     return True
+
+
+def valid_person_batch(keypoints_batch: np.ndarray) -> np.ndarray:
+    """
+    批量过滤无效人体，返回 shape=(N,) 的布尔掩码。
+    """
+    arr = np.asarray(keypoints_batch, dtype=np.float32)
+    if arr.ndim != 3 or arr.shape[2] < 2:
+        return np.zeros((0,), dtype=np.bool_)
+
+    if CPP_ACCEL_ENABLED and cpp_accel_module is not None and hasattr(cpp_accel_module, "valid_person_batch"):
+        try:
+            mask = np.asarray(
+                cpp_accel_module.valid_person_batch(
+                    arr,
+                    int(VALID_PERSON_MIN_KEYPOINTS),
+                    float(VALID_PERSON_MIN_HEIGHT),
+                ),
+                dtype=np.bool_,
+            )
+            if mask.ndim == 1 and mask.shape[0] == arr.shape[0]:
+                return mask
+        except Exception:
+            pass
+
+    valid_mask = (arr[:, :, 0] > 0.0) & (arr[:, :, 1] > 0.0)
+    valid_counts = np.sum(valid_mask, axis=1)
+
+    y_values = arr[:, :, 1]
+    y_min = np.min(np.where(valid_mask, y_values, np.inf), axis=1)
+    y_max = np.max(np.where(valid_mask, y_values, -np.inf), axis=1)
+    heights = np.where(np.isfinite(y_min) & np.isfinite(y_max), y_max - y_min, 0.0)
+
+    return (valid_counts >= int(VALID_PERSON_MIN_KEYPOINTS)) & (heights >= float(VALID_PERSON_MIN_HEIGHT))
 
 def detect_fall_sequence(history):
     if len(history) < FALL_SEQ_MIN_HISTORY:
@@ -1972,14 +2006,23 @@ while True:
             warned_no_keypoints = True
 
     if results.keypoints is not None:
-        num_people = len(results.keypoints.xy)
+        keypoints_xy_raw = results.keypoints.xy
+        if hasattr(keypoints_xy_raw, "cpu"):
+            keypoints_xy_np = np.asarray(keypoints_xy_raw.cpu().numpy(), dtype=np.float32)
+        else:
+            keypoints_xy_np = np.asarray(keypoints_xy_raw, dtype=np.float32)
+
+        num_people = int(keypoints_xy_np.shape[0])
         track_ids = list(range(num_people))
         keypoint_boxes: list[tuple[float, float, float, float]] = []
         keypoint_confs: list[float] = []
+        keypoint_valid_xy: list[np.ndarray] = []
+        valid_person_mask = valid_person_batch(keypoints_xy_np)
 
-        for idx, k in enumerate(results.keypoints.xy):
-            keypoints = k.cpu().numpy()
+        for idx in range(num_people):
+            keypoints = keypoints_xy_np[idx]
             valid_xy = keypoints[(keypoints[:, 0] > 0) & (keypoints[:, 1] > 0)]
+            keypoint_valid_xy.append(valid_xy)
             if len(valid_xy) >= 2:
                 x_min, y_min = valid_xy.min(axis=0)
                 x_max, y_max = valid_xy.max(axis=0)
@@ -2038,12 +2081,12 @@ while True:
         candidates = []
         frame_max_ratio = 0.0
 
-        for idx, k in enumerate(results.keypoints.xy):
-            keypoints = k.cpu().numpy()
+        for idx in range(num_people):
+            keypoints = keypoints_xy_np[idx]
             raw_track_id = track_ids[idx] if track_ids is not None and idx < len(track_ids) else idx
             track_id = (camera_key, int(raw_track_id))
 
-            if not valid_person(keypoints):
+            if idx >= len(valid_person_mask) or not bool(valid_person_mask[idx]):
                 continue
 
             # 过滤仅头脸/局部肢体的人体误检，防止误触发跌倒
@@ -2052,7 +2095,7 @@ while True:
                 if lower_visible < CORE_BODY_FALLBACK_LOWER_POINTS:
                     continue
 
-            valid_xy = keypoints[(keypoints[:, 0] > 0) & (keypoints[:, 1] > 0)]
+            valid_xy = keypoint_valid_xy[idx]
             if len(valid_xy) < 2:
                 continue
 
@@ -2072,7 +2115,7 @@ while True:
                     frame_max_ratio = max(frame_max_ratio, box_ratio)
 
             # 质量分：关键点数量 + 下半身完整度 + 框面积
-            valid_points = int(np.sum((keypoints[:, 0] > 0) & (keypoints[:, 1] > 0)))
+            valid_points = int(len(valid_xy))
             lower_valid = int(np.sum((keypoints[11:17, 0] > 0) & (keypoints[11:17, 1] > 0)))
             area = max(1.0, (x_max - x_min) * (y_max - y_min))
             quality = valid_points + 2.0 * lower_valid + area / 10000.0
