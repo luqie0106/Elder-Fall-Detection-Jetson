@@ -156,7 +156,7 @@ FALL_CAMERA_SOURCES=0,1 FALL_CLIP_PRE_SECONDS=5 FALL_CLIP_POST_SECONDS=5 python3
 - `FALL_MODEL_PATH`：可选模型路径或模型名（例如 `/path/to/yolov8n-pose.engine` 或 `yolov8n-pose.pt`）。
 - `FALL_MODEL_DEFAULT`：默认回退模型名（本地无模型且未指定有效 `FALL_MODEL_PATH` 时使用，默认 `yolov8n-pose.pt`）。
 
-### 2.x C++ 计算加速（默认开启，失败自动回退）
+### 3) C++ 计算加速（默认开启，失败自动回退）
 
 项目已支持 C++ 加速层（默认开启），用于加速高频 CPU 计算：
 
@@ -240,7 +240,7 @@ cd /path/to/aix_contest
 FALL_MODEL_PATH=/path/to/yolov8n-pose.engine python3 main.py
 ```
 
-#### 2.0) 模型选择顺序与默认模型修改
+#### 3.0) 模型选择顺序与默认模型修改
 
 `main.py` 启动时模型选择顺序如下：
 
@@ -302,7 +302,7 @@ cd /path/to/aix_contest
 FALL_TRACKER_BACKEND=ultralytics FALL_TRACKER=bytetrack.yaml python3 main.py
 ```
 
-### 2.1 人脸识别（可选）
+### 4) 人脸识别（可选）
 
 你可以借助 `face_recognition` 项目完成老人身份识别：
 
@@ -331,7 +331,7 @@ FALL_ENABLE_FACE_RECOG=0 python3 main.py
 FALL_ENABLE_FACE_RECOG=1 python3 main.py
 ```
 
-### 2.2 多级告警策略（已接入）
+### 5) 多级告警策略（已接入）
 
 系统已支持三级告警，减少一次性强告警误触发：
 
@@ -341,7 +341,7 @@ FALL_ENABLE_FACE_RECOG=1 python3 main.py
 
 网页记录会展示 `alert_level` 字段，便于后续筛查与统计。
 
-### 2.3 事件视频片段（已接入）
+### 6) 事件视频片段（已接入）
 
 除单帧截图外，系统会在跌倒事件发生时保存短视频片段：
 
@@ -351,7 +351,7 @@ FALL_ENABLE_FACE_RECOG=1 python3 main.py
 
 说明：`suspected/confirmed/unrecovered` 都会记录事件数据；你可在网页按级别复核。
 
-### 2.4 多摄像头并行采集（已接入）
+### 7) 多摄像头并行采集（已接入）
 
 当前已支持多路摄像头并行采集（每路独立抓帧线程，主循环统一推理与告警）：
 
@@ -369,7 +369,7 @@ FALL_CAMERA_SOURCES=0,rtsp://user:pass@192.168.1.10:554/stream1 python3 main.py
 
 启动时会对每个源尝试多种打开方式（索引、`/dev/videoX`、V4L2 后端），并输出逐路成功/失败日志，便于现场排障。
 
-### 3) 启动网页查看告警记录
+### 8) 启动网页查看告警记录
 
 ```bash
 cd /path/to/aix_contest
@@ -391,7 +391,7 @@ FALL_WEB_PORT=5002 python3 web/app.py
 FALL_WEB_PORT=5002 .venv/bin/python web/app.py
 ```
 
-### 3.1 推荐启动命令（C）
+### 9) 推荐启动命令（C）
 
 建议固定使用虚拟环境解释器，避免系统 Python 与依赖不一致：
 
@@ -417,14 +417,14 @@ pkill -f "web/app.py"
 
 改端口后访问：`http://127.0.0.1:5001`
 
-### 4) 配置微信/电话通道建议
+### 10) 配置微信/电话通道建议
 
 - 微信：推荐企业微信机器人 Webhook（可直接配置到 `config/alert_config.json` 的 `webhook.url`）
 - 电话：建议接 Twilio/阿里云语音外呼（在 `services/notifier.py` 的 phone_call 适配器中接入）
 
 > 说明：当前仓库默认开启控制台告警；Webhook/微信/电话默认关闭，避免误触发。
 
-### 5) 网页当前能力
+### 11) 网页当前能力
 
 当前网页聚焦告警复核：
 
@@ -432,7 +432,7 @@ pkill -f "web/app.py"
 - 支持一键清空所有告警记录（同时清理运行期截图/视频文件）；
 - 端口可通过 `FALL_WEB_PORT` 配置。
 
-### 6) `data/fall_events.db` 云端保持空基线
+### 12) `data/fall_events.db` 云端保持空基线
 
 如果你希望仓库（云端）里保留一个“空数据库基线”，但本地运行产生的数据不参与提交，可使用：
 
