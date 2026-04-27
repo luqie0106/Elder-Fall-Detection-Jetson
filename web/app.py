@@ -16,7 +16,7 @@ app = Flask(__name__, template_folder=str(PROJECT_ROOT / "web" / "templates"))
 
 
 def _clear_snapshot_files() -> None:
-    snapshot_dir = PROJECT_ROOT / "web" / "static" / "faces"
+    snapshot_dir = PROJECT_ROOT / "web" / "static"
     if not snapshot_dir.exists():
         return
     for file_path in snapshot_dir.iterdir():

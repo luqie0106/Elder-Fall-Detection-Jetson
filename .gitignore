@@ -200,8 +200,8 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 
 # Fall snapshot outputs (runtime-generated)
-web/static/faces/*
-!web/static/faces/.gitkeep
+web/static/*
+!web/static/.gitkeep
 .cursorignore
 .cursorindexingignore
 
